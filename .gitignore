@@ -1,0 +1,14 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Large binary data files — not needed for the published thesis
+imputationsRMFA/
+*.rds
+
+# Root-level HTML duplicate (docs/index.html is the published one)
+MIRIMFAdoc.html
+
+# Claude Code internals
+.claude/

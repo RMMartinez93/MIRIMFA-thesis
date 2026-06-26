@@ -1,0 +1,4530 @@
+---
+title: 'Reducción de dimensiones con conservación de la probabilidad conjunta en bases de datos mixtas agrupadas, estratificadas y con mecanismos de pérdida MNAR mediante el método MIRIMFA'
+author: 'Martínez Olivera Rodrigo Manuel'
+date: "2026-01-08"
+output:
+  html_document:
+    self_contained: true
+bibliography: MejorandoSCCS.bib
+header-includes:
+  - \usepackage{amsmath}
+knit: (function(inputFile, encoding) { dir.create("docs", showWarnings = FALSE); rmarkdown::render(inputFile, encoding = encoding, output_file = "docs/index.html") })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      out.extra = "",
+                      fig.align = 'center',
+                      fig.pos = "H",
+                      eval = FALSE)
+```
+
+```{r, include=FALSE, eval=T}
+# INSTALL AND LOAD PACKAGES ###############################
+
+# Installs pacman ("package manager") if needed
+if (!require("pacman")) install.packages("pacman")
+
+# Use pacman to load add-on packages as desired
+pacman::p_load(pacman, psych, rio, tidyverse, dplyr, GGally, ggplot2, ggthemes, 
+               ggvis, httr, lubridate, plotly, rmarkdown, shiny, stringr, tidyr,
+               Hmisc, corrplot, viridis, RColorBrewer, bookdown, readr, VIM, 
+               mice, UpSetR, naniar, misty, ggrepel, cramer, polycor, ggmosaic, 
+               lattice, magrittr, purrr, pan, openxlsx, FactoMineR, factoextra, 
+               forcats, scales, here, fastDummies, knitr, miceRanger, missMDA, 
+               BiocManager, patchwork, ggtext, kableExtra, pracma, xtable, 
+               forcats, moments, missForest, gridExtra, psych, reshape2,
+               MatrixCorrelation, withr)
+if (!require("missRows")) BiocManager::install("missRows")
+require(missRows)
+library(MIRIMFA2)
+```
+
+```{r latex_submatrix_fn, include=FALSE, eval=T}
+# Render a submatrix (individuals x variables) as a LaTeX array string.
+# Numeric columns are rounded; other types are coerced to character.
+# The display is transposed: rows = variables, columns = individuals.
+latex_submatrix <- function(mat, digits = 2) {
+  mat <- as.data.frame(mat)
+  mat <- as.data.frame(lapply(mat, function(col) {
+    if (is.numeric(col)) trimws(format(round(col, digits), scientific = FALSE, nsmall = digits))
+    else as.character(col)
+  }), stringsAsFactors = FALSE)
+  char_mat <- matrix(unlist(mat), nrow = nrow(mat), ncol = ncol(mat))
+  tmat <- t(char_mat)
+  cols <- paste0(rep("c", ncol(tmat)), collapse = "")
+  rows <- apply(tmat, 1, function(r) paste(r, collapse = " & "))
+  body <- paste(rows, collapse = "\\\\ ")
+  paste0("\\begin{array}{", cols, "}", body, "\\\\ \\end{array}")
+}
+
+# Split a submatrix into horizontal chunks of chunk_size individuals and
+# render each chunk as a LaTeX array via latex_submatrix.
+make_latex_chunks <- function(submat, chunk_size = 47, digits = 2) {
+  submat <- as.data.frame(submat)
+  n <- nrow(submat)
+  lapply(seq(1, n, by = chunk_size), function(i) {
+    latex_submatrix(submat[i:min(i + chunk_size - 1, n), , drop = FALSE], digits = digits)
+  })
+}
+```
+
+# Introducción
+
+En las últimas décadas, el análisis estadístico se ha visto
+profundamente transformado por la integración de bases de datos
+preexistentes. 
+Este proceso permite reunir múltiples fuentes de
+información sobre los mismos individuos, dando lugar a conjuntos de
+datos de gran tamaño y alta complejidad, en los que las variables suelen organizarse de manera natural en grupos o tablas temáticas.
+En este contexto, resulta fundamental disponer de métodos de reducción de dimensiones que no sólo sean capaces de sintetizar la información, sino que además respeten dicha estructura agrupada. \footnote{Versión optimizada para HTML.}
+
+El **Análisis Factorial Múltiple** (Multiple Factor Analysis, MFA) [@pages_analyse_2002] constituye un marco de referencia para este tipo de problemas. 
+Este método extiende el análisis factorial clásico al permitir el tratamiento conjunto de varias tablas de variables, potencialmente de naturaleza mixta, garantizando un equilibrio entre los distintos grupos. Sin embargo, a pesar de sus ventajas conceptuales, el MFA presenta una limitación importante: **no puede aplicarse directamente en presencia de datos faltantes**. 
+Esta restricción resulta especialmente problemática en bases de datos integradas, donde la heterogeneidad de las fuentes hace que la aparición de valores faltantes sea prácticamente inevitable.
+
+Tradicionalmente, el estudio de los datos faltantes se ha apoyado en la taxonomía propuesta por Rubin [-@rubin_inference_1976], que clasifica los mecanismos de pérdida según la relación entre la ausencia de los datos y los valores observados o no observados. 
+En este marco, se distinguen tres mecanismos principales: pérdida de datos completamente al azar (MCAR), pérdida de datos al azar condicionada a los datos observados (MAR) y pérdida de datos no aleatoria, o condicionada a los mismos valores faltantes (MNAR).
+Esta clasificación ha servido como base teórica para el desarrollo de numerosos métodos de imputación y análisis.
+
+No obstante, la taxonomía de Rubin fue concebida en el contexto de
+diseños de muestreo tradicionales y no contempla ciertos tipos de
+dependencias internas en el patrón de datos faltantes. 
+En muchas bases de datos modernas (como registros administrativos, estudios históricos o recopilaciones etnográficas) la ausencia de un dato no sólo depende de las características del individuo o de la variable, sino también de la ausencia de otros datos relacionados.
+
+Para abordar esta limitación, Jackson et al. [-@jackson_complete_2023] propusieron una extensión del marco clásico introduciendo el concepto de **pérdida estructurada**. 
+Su enfoque se basa en el análisis de la matriz indicadora de datos faltantes, denotada por $\mathbf{R}$, cuyos elementos toman el valor 1 si el dato está presente y 0 en caso contrario. 
+En este marco, la estructura de $\mathbf{R}$ puede depender no solo de los datos originales (observados o no observados), sino también de otros elementos de la propia matriz indicadora, es decir, de la ausencia de otros datos.
+
+Esta ampliación da lugar a una nueva taxonomía de los mecanismos de
+pérdida. 
+En primer lugar, se distinguen los mecanismos **no estructurados (U)**, en los que la ausencia de un dato es independiente de la ausencia de otros, y los mecanismos **estructurados (S)**, en los
+que existen dependencias entre ausencias. 
+A su vez, dentro de la pérdida estructurada, se diferencian los casos **fuertemente estructurados (SS)**, donde las dependencias son deterministas, y **débilmente estructurados (WS)**, donde las dependencias son aleatorias. 
+Finalmente, estas dependencias pueden manifestarse a nivel de individuos (efecto de sujeto, SE) o de variables, dando lugar a estructuras en bloques (BS) o secuenciales (SqS).
+
+El reconocimiento de estos mecanismos resulta crucial para el análisis de bases de datos contemporáneas, en las que los patrones de ausencia suelen reflejar decisiones institucionales, restricciones operativas o procesos históricos, más que simples fenómenos de pérdida aleatoria.
+Sin embargo, los métodos actuales presentan limitaciones importantes frente a esta complejidad.
+
+Entre los enfoques propuestos en la literatura se encuentra la **Imputación Multivariada por Cadenas de Ecuaciones (MICE)** [@van_buuren_flexible_2018], que genera múltiples conjuntos de datos imputados mediante modelos condicionales iterativos. 
+A pesar de su flexibilidad, MICE sólo ha sido validado para mecanismos no estructurados ignorables (MCAR-U y MAR-U) y no está diseñado para preservar la estructura agrupada ni para su integración con métodos de reducción de dimensiones (a partir de aquí referidos mediante el adjetivo *"factorial"*). 
+Otros enfoques, como el **método de categoría única perdida** [@van_der_heijden_multiple_2003], permiten aplicar técnicas factoriales estándar, pero ignoran la incertidumbre asociada a la imputación y solo son válidos en casos muy específicos de MNAR no estructurado.
+
+En el ámbito del MFA, se han propuesto métodos específicos para tratar datos faltantes. 
+**La Imputación Múltiple mediante MFA (MIMFA)** [@voillet_handling_2016] incorpora imputación múltiple y maneja ciertos mecanismos estructurados, pero se limita a variables numéricas y presenta restricciones computacionales importantes. 
+Por su parte, **la Imputación mediante MFA Regularizado Iterativo (RIMFA)** [@husson_handling_2013] permite tratar una amplia gama de mecanismos no estructurados e incluso algunos casos de MNAR débilmente estructurado, aunque produce una única imputación, lo que impide capturar adecuadamente la incertidumbre asociada a los valores faltantes.
+
+Ante estas limitaciones, este trabajo introduce **MIRIMFA (Imputación Múltiple mediante MFA Regularizado Iterativo)**, un método diseñado específicamente para manejar un tipo particular de mecanismos MNAR débilmente estructurados en bases de datos agrupadas. 
+El enfoque propuesto es capaz de abarcar otros mecanismos como casos particulares, al tiempo que preserva la estructura y la distribución conjunta de los datos. 
+Estas características buscan hacer que MIRIMFA resulte especialmente adecuado para contextos en los que la ausencia de datos refleja sesgos sistemáticos en la recolección de información, como ocurre frecuentemente en estudios antropológicos, históricos o administrativos.
+
+# Estructura del documento
+
+Dado que MIRIMFA tiene muchos elementos que no son parte del marco básico de la reducción de dimensiones o del análisis de datos faltantes, se optó por una estructura que prioriza la intuición práctica y la familiarización concreta antes que la abstracción matemática. 
+Por ello, este trabajo desarrolla la metodología de la mano de un estudio concreto, con discusiones paralelas sobre los detalles teóricos a lo largo de cada sección.
+
+El ejercicio inicia con la presentación de la base de datos *Poison* y su análisis mediante MFA. A continuación se introduce la taxonomía de datos faltantes y se aplica la amputación de los datos bajo un patrón de pérdida débilmente estructurado. Con este antecedente, se desarrolla RIMFA, seguido de la imputación múltiple y su agregado mediante ACT-STATIS, obteniendo finalmente la imputación compromiso $\mathbf{X}_{[+]}$.
+Finalmente, se evalúa el resultado comparándolo con los datos originales no amputados, y se generaliza el método en la sección de implementación.
+
+En cada una de estas secciones, formalizaré los componentes del algoritmo. 
+Primero discutiré el método de Análisis de Componentes Principales Generalizado (GPCA) y las equivalencias del Análisis de Correspondencias Múltiples (MCA) y el Análisis de Componentes Principales (PCA), bases necesarias para fundamentar el MFA.
+Posteriormente introduciré la taxonomía de datos faltantes de Jackson et al. y detallaré el funcionamiento de RIMFA según el trabajo de Husson y Josse. 
+Después, presentaré ACT-STATIS y concluiré con la definición del Coeficiente $R_V$ ajustado como método de evaluación.
+
+Es necesario precisar que los componentes descritos corresponden a desarrollos existentes en la literatura; la contribución de este trabajo radica en su integración en un único flujo de trabajo. 
+No obstante, la revisión formal aquí presentada resulta fundamental, ya que provee una notación unificada que facilita la comprensión del proceso conjunto.
+
+Asimismo, es importante advertir que, aunque la base de datos del capítulo "Ejemplo" representa el caso de escala mínima para la viabilidad del método, el volumen de los datos y las dimensiones de las matrices resultantes siguen siendo considerables. 
+Por ello, se sugiere optar por la versión HTML de este documento (disponible en: [POR DEFINIR]) para una visualización más cómoda de las estructuras matriciales.
+
+# Base de datos *Poison* y su preparación
+
+El objetivo de esta sección es ejemplificar el método **MIRIMFA** bajo condiciones controladas, en las que el mecanismo de pérdida de datos y la estructura subyacente de la base son conocidos. En la vida real, no se conocen estas estructuras y es justo esta incertidumbre la que motiva el análisis de datos perdidos. Sin embargo, el tener los datos faltantes conocidos nos permite contrastar la realidad con los resultados de la simulación.
+
+Es importante destacar que este estudio no busca demostrar una superioridad universal de MIRIMFA frente a otros métodos de imputación, sino ilustrar su comportamiento en escenarios para los cuales fue diseñado: datos mixtos, organizados en grupos y con pérdida estructurada.
+
+Comencemos con una simulación basada en la base de datos *Poison*.
+Ésta se encuentra incluida en el paquete de R `FactoMineR` [@le_factominer_2008]. 
+Nos interesa ya que es un ejemplo típico del problema que nos interesa en este trabajo: datos mixtos con estructura agrupada.
+La base describe a un conjunto de niños y personal escolar que sufrieron intoxicación por alimentos.
+Los datos de éstos se recolectaron en varias tablas que recogen información demográfica, clínica y de exposición, combinando variables cuantitativas y cualitativas.
+Finalmente, estas tablas fueron reunidas en una sola base datos, *Poison*, la cual se despliega a continuación:
+
+```{r, eval=TRUE}
+data(poison)
+poison <- poison[order(poison$Age), ]
+rownames(poison) <- NULL
+poisonNames <- colnames(poison)
+poison <- dummy_cols(poison,remove_first_dummy = T, remove_selected_columns = T)
+colnames(poison) <- poisonNames
+rm(poisonNames)
+poison[, 3:ncol(poison)] <- lapply(poison[, 3:ncol(poison)], as.factor)
+levels(poison[,4]) <- c("F","M")
+
+result <- MFA(poison,
+              group = c(2, 2, 5, 6),
+              type = c("s", "n", "n", "n"),
+              name.group = c("desc", "desc2", "symptom", "eat"),
+              ncp = 12,
+              graph = FALSE)
+```
+
+```{r, eval=TRUE}
+Jn <- c(2,2,5,6)
+J <- sum(Jn)
+N <- length(Jn)
+M <- 2
+I <- nrow(poison)
+# Define individual blocks
+Y_11 <- poison[poison$Age<13,1:cumsum(Jn)[1]]
+Y_12 <- poison[poison$Age<13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Y_13 <- poison[poison$Age<13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Y_14 <- poison[poison$Age<13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+Y_21 <- poison[poison$Age>=13,1:cumsum(Jn)[1]]
+Y_22 <- poison[poison$Age>=13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Y_23 <- poison[poison$Age>=13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Y_24 <- poison[poison$Age>=13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+
+# Store in a list of lists
+Y <- list(
+  stratum1 = list(Y_11 = Y_11, Y_12 = Y_12, Y_13 = Y_13, Y_14 = Y_14),
+  stratum2 = list(Y_21 = Y_21, Y_22 = Y_22, Y_23 = Y_23, Y_24 = Y_24)
+)
+
+YGroups <- list(
+Ydot1 = rbind.data.frame(Y_11,Y_21),
+Ydot2 = rbind.data.frame(Y_12,Y_22),
+Ydot3 = rbind.data.frame(Y_13,Y_23),
+Ydot4 = rbind.data.frame(Y_14,Y_24)
+)
+
+Y1dot <- cbind.data.frame(Y_11, Y_12, Y_13, Y_14)
+Y2dot <- cbind.data.frame(Y_21, Y_22, Y_23, Y_24)
+
+In <- c(nrow(Y_11),nrow(Y_21))
+```
+
+```{r,eval=T}
+# Define individual blocks
+Y_11prime <- Y_11
+Y_12prime <- tab.disjonctif(Y_12)
+Y_13prime <- tab.disjonctif(Y_13)
+Y_14prime <- tab.disjonctif(Y_14)
+Y_21prime <- Y_21
+Y_22prime <- tab.disjonctif(Y_22)
+Y_23prime <- tab.disjonctif(Y_23)
+Y_24prime <- tab.disjonctif(Y_24)
+
+# Store in a list of lists
+Yprime <- list(
+  stratum1 = list(Y_11 = Y_11prime, Y_12 = Y_12prime, Y_13 = Y_13prime, Y_14 = Y_14prime),
+  stratum2 = list(Y_21 = Y_21prime, Y_22 = Y_22prime, Y_23 = Y_23prime, Y_24 = Y_24prime)
+)
+YGroupsprime <- list(
+Ydot1prime = rbind.data.frame(Y_11prime,Y_21prime),
+Ydot2prime = rbind.data.frame(Y_12prime,Y_22prime),
+Ydot3prime = rbind.data.frame(Y_13prime,Y_23prime),
+Ydot4prime = rbind.data.frame(Y_14prime,Y_24prime)
+)
+
+YprimeGroups <- list()
+
+Y1dotprime <- cbind.data.frame(Y_11prime, Y_12prime, Y_13prime, Y_14prime)
+Y2dotprime <- cbind.data.frame(Y_21prime, Y_22prime, Y_23prime, Y_24prime)
+
+Kn <- unlist(lapply(YGroupsprime, ncol))
+K <- sum(Kn)
+```
+
+```{r poisonTab, eval=T}
+knitr::kable(poison, 
+             caption = "Datos brutos de la base de datos Poison.", 
+#             format = "latex", 
+#             booktabs = TRUE,
+#             longtable = TRUE,
+#             position = "p",
+#             table.envir = "figure",
+             col.names = c("Edad",
+                           "Tiempo",
+                           "Enfermo",
+                           "Sexo",
+                           "Náusea",
+                           "Vómito",
+                           "Dolor abdominal",
+                           "Fiebre",
+                           "Diarrea",
+                           "Papas",
+                           "Pescado",
+                           "Mayonesa",
+                           "Calabacín",
+                           "Queso",
+                           "Helado"))# %>%
+#  kable_styling(latex_options = c("repeat_header"), font_size = 7) %>% 
+#  row_spec(0, angle = 90)
+#  column_spec(1, width = "1.5cm") %>%
+#  column_spec(2, width = "5cm") %>%
+#  column_spec(3, width = "3cm")
+```
+
+Esta base es un ejemplo mínimo, y aún así ya es de considerable tamaño.
+Por esta razón, nos conviene buscar métodos de reducción de dimensiones que conserven la distribución conjunta de los datos.
+La respuesta más familiar a muchos sería un Análisis de Componentes Principales (PCA). 
+Sin embargo, además de variables continuas tenemos categóricas.
+El PCA directo exigiría tratar las variables categóricas como continuas. 
+Si bien la distorsión es pequeña con variables binarias, como es nuestro caso, en bases de datos con variables con múltiples categorías, se correría el riesgo de estar tratando como múltiples variables lo que de hecho es una sola: perderíamos la estructura agrupada de la información. 
+Por otro lado, la siguiente opción más popular sería un Análisis de Correspondencias Múltiples (MCA), pero éste queda descartado debido a la presencia de variables continuas.
+
+Entonces, se requiere un método de análisis multivariado mixto. 
+La literatura ofrece dos alternativas: 
+
+* El Análisis de Factores de Datos Mixtos (FAMD): Preserva la estructura de las categorías dentro de cada variable. Pero supone que no existen dependencias estructurales previas entre variables; es decir, asume que cualquier correlación entre éstas es un objeto de interés.
+* El Análisis de Factores Múltiples (MFA): Asume que las variables se organizan de forma intrínseca en grupos bien definidos cuya influencia individual podría distorsionar el análisis global si no lo balanceamos adecuadamente.
+
+Esta última situación es característica de datos integrados de múltiples fuentes, como *Poison*. 
+Precisamente para éste, tomemos en cuenta que la información proviene de tres bloques independientes: registros escolares, de la cafetería y de la enfermería. 
+Con este preámbulo, procederé al análisis de la estructura de la base de datos.
+
+### Estructura general de la base
+
+Como se puede ver más arriba, la base *Poison* contiene `r nrow(poison)` individuos y `r ncol(poison)` variables.
+Organicémoslas en cuatro grupos, de acuerdo con la naturaleza de las variables. 
+Estos son:
+
+1. **Grupo 1 (variables continuas)**  
+   Dos variables cuantitativas:
+   - Edad del individuo (`Age`),
+   - Tiempo de recolección (`Time`).
+
+2. **Grupo 2 (variables categóricas)**  
+   Dos variables categóricas:
+   - Sexo (`Sex`),
+   - Condición de enfermedad (`Sick`).
+
+3. **Grupo 3 (síntomas)**  
+   Cinco variables categóricas binarias que indican la presencia o ausencia de síntomas:
+   - Náusea (`Nausea`),
+   - Vómito (`Vomiting`),
+   - Dolores abdominales (`Abdominals`),
+   - Fiebre (`Fever`),
+   - Diarrea (`Diarrhea`).
+
+4. **Grupo 4 (alimentos consumidos)**  
+   Seis variables categóricas binarias que indican el consumo de distintos alimentos:
+   - Papas (`Potato`),
+   - Pescado (`Fish`),
+   - Mayonesa (`Mayo`),
+   - Calabacín (`Courgette`),
+   - Queso (`Cheese`),
+   - Helado (`Icecream`).
+
+Esta estructura da lugar a un total de $N = 4$ grupos y $J = `r J`$ variables. 
+Nótese que, aunque provengan de la misma fuente, dos tipos de variable diferentes tienen que pertenecer a grupos diferentes.
+
+### Estratificación de los individuos
+
+Además de la estructura por grupos de variables, dividiré la base en **dos estratos de individuos** definidos a partir de la edad:
+
+- **Estrato 1**: individuos menores de 12 años,
+- **Estrato 2**: individuos de 13 años o más.
+
+Denoto por $I_{[1]} = `r In[1]`$ y $I_{[2]} = `r In[2]`$ el número de individuos en cada estrato, respectivamente, de modo que el total es $I = `r I`$. 
+Esta estratificación no es indispensable para el MFA, pero la utilizaré más adelante para la amputación.
+
+### Representación matricial
+
+Denotaré la matriz completa de datos como $\mathbf{Y}\in\mathbb{R}^{I\times J}$. Esta matriz puede representarse como una partición doble, por estratos (filas) y por grupos de variables (columnas):
+
+\begin{equation*}
+\label{eq:1}
+\mathbf{Y}=
+\left[
+\begin{array}{c|c|c|c}
+\mathbf{Y}_{[1,1]} & \mathbf{Y}_{[1,2]} & \mathbf{Y}_{[1,3]} & \mathbf{Y}_{[1,4]} \\
+\hline
+\mathbf{Y}_{[2,1]} & \mathbf{Y}_{[2,2]} & \mathbf{Y}_{[2,3]} & \mathbf{Y}_{[2,4]}
+\end{array}
+\right],
+\end{equation*}
+donde $\mathbf{Y}_{[m,n]}$ representa la submatriz correspondiente al estrato $m$ y al grupo de variables $n$.
+Por ejemplo, la submatriz $\mathbf{Y}_{[1,4]}$ contiene la información sobre los alimentos consumidos (grupo 4) por los individuos del estrato 1 (menores de 12 años)
+
+Una base de datos de esta forma se vería de la siguiente manera:
+
+
+```{r voilletTables, echo=FALSE, fig.cap="Pérdida estructurada típica de las bases de datos compiladas con tablas preexistentes. Las partes coloreadas representan estratos de la base de datos mientras que las parter vacías indican datos perdidos. Adaptado de Voillet et al. (2016).", out.width = '100%', eval=TRUE}
+knitr::include_graphics(here( "ExternalFigures", "12859_2016_1273_Fig1_HTML.png"))
+```
+
+
+Repito: la estructura estratificada no es estrictamente necesaria para el MFA o ninguno de los métodos aquí vistos, por lo que el problema general se resume a una reducción de dimensiones de  $\mathbf{Y}\in\mathbb{R}^{I\times J}$ obtenida concatenando $N$ subtablas por columnas: 
+\begin{equation}
+\mathbf{Y}=\left[\mathbf{Y}_{[1]}\mid \cdots \mid \mathbf{Y}_{[n]} \mid \cdots \mid \mathbf{Y}_{[N]}\right],
+\end{equation} donde cada subtabla $\mathbf{Y}_{[n]}\in\mathbb{R}^{I\times J_{[n]}}$ describe a los mismos $I$ individuos y contiene variables de un solo tipo (cuantitativas o cualitativas), con $J_{[n]}$ columnas.
+
+Si el grupo $n$ es cualitativo, denotemos por $K_{[n]}$ el número total de categorías asociadas a sus variables. 
+Si el grupo $n$ es cuantitativo, $K_{[n]}=J_{[n]}$, y llamemos $K=\sum_{n=1}^N K_{[n]}$ el número total de categorías.
+
+Para nuestro ejemplo, las submatrices son:
+
+```{r latex_Y, eval=T}
+chunk_size <- 47
+latex_Y <- lapply(Y, function(stratum) lapply(stratum, make_latex_chunks))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: Y[1,s], s = 1,...,4</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Y11}
+    \begin{split}
+      \mathbf{Y}_{[1,1]}^\intercal=&
+      \left[`r latex_Y[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y12}
+    \begin{split}
+      \mathbf{Y}_{[1,2]}^\intercal=&
+      \left[`r latex_Y[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y13}
+    \begin{split}
+      \mathbf{Y}_{[1,3]}^\intercal=&
+      \left[`r latex_Y[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y14}
+    \begin{split}
+      \mathbf{Y}_{[1,4]}^\intercal=&
+      \left[`r latex_Y[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: Y[2,s], s = 1,...,4</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Y21}
+    \begin{split}
+      \mathbf{Y}_{[2,1]}^\intercal=&
+      \left[`r latex_Y[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y22}
+    \begin{split}
+      \mathbf{Y}_{[2,2]}^\intercal=&
+      \left[`r latex_Y[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y23}
+    \begin{split}
+      \mathbf{Y}_{[2,3]}^\intercal=&
+      \left[`r latex_Y[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y24}
+    \begin{split}
+      \mathbf{Y}_{[2,4]}^\intercal=&
+      \left[`r latex_Y[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+Entonces, cada grupo de variables $\mathbf{Y}_{[\cdot,n]}$ contiene $J_{[n]}$ columnas, con:
+\[
+\{J_{[n]}\}_{n=1}^4 = \{`r knitr::combine_words(as.character(Jn), and = ",", oxford_comma = FALSE)`\}.
+\]
+
+Dado que cada variable binaria tiene dos categorías, y contando cada variable continua como una sola categoría, el número de categorías de cada grupo es:
+\[
+\{K_{[n]}\}_{n=1}^4 = \{`r knitr::combine_words(as.character(Kn), and = ",", oxford_comma = FALSE)`\},
+\]
+lo que da un total de $K = `r K`$.
+
+### Tabla Disyuntiva Completa
+
+El MFA opera sobre la tabla disyuntiva completa $\mathbf{Y}'\in\mathbb{R}^{I\times K}$ definida grupo a grupo: 
+
+- Para
+grupos cuantitativos: $\mathbf{Y}'_{[n]}=\mathbf{Y}_{[n]}$. 
+- Para grupos
+cualitativos: $\mathbf{Y}'_{[n]}$ es la matriz de indicadores
+correspondiente.
+
+Así, \begin{equation}
+\mathbf{Y}'=\left[\mathbf{Y}'_{[1]}\mid \cdots \mid \mathbf{Y}'_{[N]}\right].
+\end{equation}
+
+Dicho de otra forma, se expande cada variable categórica creando una nueva variable por categoría. 
+Esta nueva variable vale 1 si el individuo pertenece a dicha categoría y 0 si no. 
+La MDC de *Poison* dividida en sus submatrices es:
+
+
+```{r latex_Yprime, eval=T}
+latex_Yprime <- lapply(Yprime, function(stratum) lapply(stratum, make_latex_chunks))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: Y'[1,s], s = 1,...,4</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Y11prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[1,1]}=&
+      \left[`r latex_Yprime[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y12prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[1,2]}=&
+      \left[`r latex_Yprime[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y13prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[1,3]}=&
+      \left[`r latex_Yprime[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y14prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[1,4]}=&
+      \left[`r latex_Yprime[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: Y'[2,s], s = 1,...,4</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Y21prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[2,1]}=&
+      \left[`r latex_Yprime[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y22prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[2,2]}=&
+      \left[`r latex_Yprime[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y23prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[2,3]}=&
+      \left[`r latex_Yprime[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y24prime}
+    \begin{split}
+      \mathbf{Y}'^\intercal_{[2,4]}=&
+      \left[`r latex_Yprime[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+
+
+Nótese que la creación de variables indicadoras se hace sin excluir categorías, por eso el adjetivo "completa" en la matriz disyuntiva. 
+Esto explica que la tercera y cuarta columnas de $\mathbf{Y}'$ sean idénticas pero con valores contrarios, dado que en este caso representan la presencia y ausencia de enfermedad. 
+Lo mismo con la quinta y la sexta y consecutivas. 
+Esto no es problema para el MFA ya que éste implícitamente retira las dependencias lineales mediante la aplicación del rango sobre la matriz. 
+Además, nótese también que el número de variables de cada submatriz $\mathbf{Y}'_{[n]}$ no necesariamente es el mismo que el de $\mathbf{Y}_{[n]}$, $J_{[n]}$, precisamente debido a las variables indicadoras, sino que es $K_{[n]}$.
+
+
+# Análisis Factorial Múltiple
+
+Con la estructura de Poison establecida —dos estratos, cuatro grupos de variables de naturaleza mixta y una organización jerárquica que no puede ignorarse— el siguiente paso natural es un método de reducción de dimensiones que respete esa estructura. Ese método es el Análisis Factorial Múltiple.
+
+
+Para aplicar el MFA a *Poison*, el flujo de trabajo después de obtener la MDC será el siguiente:
+
+1.  Se calcula un vector de ponderación de columnas $\mathbf{c}$.
+2.  Se define un vector de ponderación de filas $\boldsymbol{r}$.
+2.  Se aplica un PCA para cada grupo numérico.
+3.  Se aplica un MCA para cada grupo categórico.
+4.  Se calcula el vector de ponderación grupal $\mathbf{a}$.
+5.  Se construye la matriz ponderada $\mathbf{Y}^*$ .
+5.  Se calcula el PCA de $\mathbf{Y}^*$.
+
+Como se puede observar, tanto el PCA como el MCA forman partes clave del MFA. 
+Para entender su rol y el de las ponderaciones intermedias, pasaré a discutir el fundamento teórico del MFA, dando por supuesto que el lector conoce tanto el PCA y el MCA y sólo requiere una discusión abstracta que relaciones los conceptos.
+
+### PCA: formulación matricial mínima
+
+Sea $\mathbf{Y}\in\mathbb{R}^{I\times J}$ una matriz de datos (centrada y, cuando corresponda, estandarizada) con $I$ individuos y $J$ variables\footnote{De aquí en adelante, se tomará la convención de que una mayúscula en negritas y letra redonda, como $\mathbf{Y}$, es una matriz, una minúscula en negritas y redonda es un vector, como $\mathbf{y}$, y una minúscula en cursivas y con subíndices es el elemento genérico de su equivalente vectorial o matricial, según el número de subíndices. Así, $y_i$ representa el elemento genérico del vector $\mathbf{y}$ y $y_{ij}$ es el elemento genérico de $\mathbf{Y}$.}.
+El PCA busca representar a los individuos en un nuevo sistema de coordenadas tal que se maximice la varianza proyectada sobre los primeros ejes de este nuevo sistema. 
+Las coordenadas de este sistema se llamarán direcciones principales.
+Al tener la gran mayoría de la varianza en las primeras direcciones principales, las últimas se pueden eliminar sin comprometer la estructura general de la nube de datos. 
+Esto permite ver el PCA como una reducción de dimensiones donde las nuevas dimensiones son una transformación lineal de las antiguas: \begin{equation}
+\mathbf{T}=\mathbf{Y}\mathbf{W},
+\end{equation} 
+donde $\mathbf{W}\in\mathbb{R}^{J\times J}$ es una matriz ortonormal cuyas columnas definen las direcciones principales, y $\mathbf{T}\in\mathbb{R}^{I\times J}$ contiene las coordenadas (scores) de los individuos en dichas direcciones.
+
+Para obtener $\mathbf{W}$, uno tiene que obtener la matriz de covarianza de los datos estandarizados 
+\begin{equation}
+    \text{Var}(\mathbf{Y}) = \frac{1}{I} \mathbf{Y}^\intercal \mathbf{Y},
+\end{equation} 
+y resolver el problema de autovalores 
+\begin{equation}
+    \text{Var}(\mathbf{Y}) \mathbf{w}_j = \lambda_j \mathbf{w}_j.
+\end{equation}
+Los autovectores $\mathbf{w}_k$ se ordenan según su correspondiente autovalor $\lambda_k$ de mayor a menor tamaño. 
+Los autovectores ordenados en columnas forman la solución $\mathbf{W}$.
+
+Una forma equivalente de obtener esta representación es mediante la descomposición en valores singulares (SVD): 
+\begin{equation} 
+\mathbf{Y}=\mathbf{U}\boldsymbol{\Sigma}\mathbf{W}^\intercal.
+\end{equation} 
+Dado que $\mathbf{W}$ es ortogonal, se sigue que: 
+\begin{equation}
+\mathbf{T}=\mathbf{Y}\mathbf{W}=\mathbf{U}\boldsymbol{\Sigma}, \label{eq:tusigma}
+\end{equation} 
+donde $\mathbf{U}$ es la matriz cuyas columnas son los
+eigenvectores de $\mathbf{Y}\mathbf{Y}^\intercal$ y $\boldsymbol{\Sigma}$ es la matriz de valores singulares:
+$$
+\Sigma=\text{diag}(\sqrt{\lambda_1},\dots,\sqrt{\lambda_J})
+$$
+
+En esta notación, las columnas de $\mathbf{W}$ corresponden a las direcciones principales en el espacio de variables, mientras que $\mathbf{U}\boldsymbol{\Sigma}$ da las coordenadas de los individuos en el espacio reducido. 
+La reducción de dimensiones se obtiene reteniendo las primeras $S$ columnas de $\mathbf{W}$ (y, de manera equivalente, las primeras $S$ columnas de $\mathbf{T}$).
+
+En lo que sigue utilizaremos la formulación mediante el SVD porque permite expresar MCA y MFA como casos de un PCA ponderado, lo cual es esencial para definir los pasos de reconstrucción en RIMFA.
+
+### Limitación del PCA con variables categóricas
+
+Como mencionamos antes, el PCA presupone variables continuas.
+Más estrictamente, asume una geometría euclidiana sobre variables numéricas (tras centrar y/o estandarizar). 
+Cuando las variables son categóricas, una representación directa mediante indicadores binarios no preserva adecuadamente la asociación entre categorías. 
+Por esta razón se suele utilizar el Análisis de Correspondencias
+Múltiples (MCA), que define una métrica distinta basada en desviaciones respecto de la independencia entre variables.
+
+### MCA como PCA ponderado
+
+Sea $\mathbf{Y}'\in\mathbb{R}^{I\times K}$ la matriz de indicadores de variables categóricas (también llamada tabla disyuntiva), donde $K$ es el número total de categorías.
+Denotemos por $\mathbf{Z}\in\mathbb{R}^{I\times K}$ la versión normalizada de $\mathbf{Y}'$ y por $\mathbf{E}$ la matriz esperada bajo independencia:
+$$
+\mathbf{E}=\mathbf{r}\mathbf{c},
+$$
+donde $\mathbf{r}$ son las sumas marginales por renglón de $\mathbf{Z}$ y $\mathbf{c}$ son las sumas marginales por columna.
+
+El MCA se construye a partir de la matriz de residuales \begin{equation}
+\mathbf{D}=\mathbf{Z}-\mathbf{E}.
+\end{equation}
+
+El MCA busca descomponer los residuales en dimensiones, asignando porciones de esta variación a ejes individuales. 
+Para lograr esto, se realiza un PCA sobre $\mathbf{D}$, ponderado para prevenir la influencia excesiva de los individuos o categorías con mayor frecuencia. 
+En otras palabras, obtenemos $\mathbf{D}'$, que es la matriz cuyo elemento genérico es:
+$$
+D'_{ij}=D_{ij}\sqrt{r_ic_j}
+$$
+Este procedimiento equivale a trabajar con la métrica $\chi^2$ propia del análisis de correspondencias.
+En consecuencia, MCA produce ejes que maximizan la desviación respecto a la condición independencia, y la reducción de dimensiones consiste en descartar ejes con baja contribución a dicha desviación.
+
+Con la equivalencia entre de MCA como PCA ponderado sobre una tabla disyuntiva, podremos integrar variables cualitativas y cuantitativas dentro del MFA. Aunque es necesario además normalizar por grupos para evitar que una tabla domine, como veremos más adelante.
+
+
+### Ponderación conjunta
+
+```{r, eval=T}
+MDC <- as.data.frame(dummy_cols(poison,remove_selected_columns = T))
+w <- as.vector(rep(1/nrow(poison), nrow(poison)))
+b <- as.vector(1-colMeans(MDC))
+
+JperCol <- unlist(lapply(1:N, function(i) rep(ncol(YGroups[[i]]), Kn[i])))
+
+
+preLambda <- list()
+preLambda[[1]] <- PCA(YGroups[[1]],graph = FALSE)[["eig"]][1,1]
+preLambda[[2]] <- MCA(YGroups[[2]],graph = FALSE)[["eig"]][1,1]
+preLambda[[3]] <- MCA(YGroups[[3]],graph = FALSE)[["eig"]][1,1]
+preLambda[[4]] <- MCA(YGroups[[4]],graph = FALSE)[["eig"]][1,1]
+preLambda <- unlist(preLambda)
+Lambda <- list()
+for (i in 1:N) {
+  Lambda[[i]] <- rep(preLambda[i],Kn[i])
+}
+Lambda <- unlist(Lambda)
+
+d <- b/JperCol
+d[1] <- 1
+d[2] <- 1
+
+a <- d/Lambda
+
+GlobPCApoison <- PCA(as.data.frame(MDC),
+                     graph=F,
+                     col.w = as.vector(a), 
+                     row.w = w)
+```
+
+Formalmente, el MFA puede verse como un **PCA ponderado** aplicado a
+$\mathbf{Y}'$. Para ello, aplicamos las ponderaciones descritas en la sección anterior:
+
+**Pesos de filas.**\
+Se define un vector $\mathbf{r}\in\mathbb{R}^I$ tal que $\sum_{i=1}^I w_i=1$, que controla la contribución relativa de los individuos. 
+En ausencia de información adicional, tomaremos típicamente $r_i=1/I\ \forall\  i$.
+Entonces, en el caso de *Poison*, $r_i\approx`r format(round(1/nrow(poison),3), scientific = FALSE, nsmall = 3)` \  \forall i$.
+
+**Pesos de columnas (métrica de base).**\
+Se define un vector $\mathbf{c}\in\mathbb{R}^K$: \begin{equation}
+c_k=
+\begin{cases}
+1, & \text{si } k \text{ corresponde a una variable cuantitativa},\\[4pt]
+\dfrac{1}{J_{[n(k)]}}\left(1-\mathrm{p}(k)\right), & \text{si } k \text{ corresponde a una categoría},
+\end{cases}
+\end{equation} 
+donde $\mathrm{p}(k)$ es la proporción marginal de la categoría $k$ y $n(k)$ indica el grupo al que pertenece. 
+Esta elección reproduce la métrica del MCA en los bloques cualitativos y asegura una contribución equilibrada dentro de cada grupo.
+
+Comencemos por calcular un vector de ponderación de columnas $\mathbf{c}$ para *Poison*. A cada categoría $k$ de las `r K` categorías de nuestra base de datos, le asignaremos un valor $c_k$. Si $k$ corresponde a una variable continua, $c_k$ valdrá 1. Entonces, dado que en *Poison* la primera y
+segunda variables son numéricas, $c_1=c_2=1$.
+
+Si $k$ es una categoría de una variable discreta, se tiene que hacer el siguiente procedimiento para calcular $c_k$:
+Se calcula $p(k)$, la proporción marginal de la categoría $k$. Esto es: contamos la totalidad de observaciones en esta categoría y la dividimos entre el total de observaciones. Así, para $k=3$, $p(3)=\frac{`r sum(as.numeric(MDC[[3]]))`}{`r I`}\approx`r  format(round(mean(as.numeric(MDC[[3]])),3), scientific = FALSE, nsmall = 3)`$. 
+Por lo tanto, las proporciones marginales son:
+$$\mathbf{p}(k)\approx[`r format(round(as.numeric(colMeans(MDC[,3:J])),3), scientific = FALSE, nsmall = 3)`]; \quad k=3,...,`r J`$$
+
+Luego, nos fijamos en el grupo de variables que contiene a nuestra categoría ($n(k)$). En este caso, estamos en el segundo grupo $n(k)=2$ y tomamos el número de variables que comprenden dicho grupo $J_{n(k)}$, que en este caso es $J_{n(k)}=2$.
+
+Finalmente, calculamos $c_k$ para las variables categóricas como:
+
+$$c_k=\frac{1}{J_{[n(k)]}}(1-p(k))$$
+
+Por lo tanto,
+
+\begin{equation}
+d_3=\frac{1}{J_{2}}\left(1-p(3)\right)\approx\frac{1}{`r JperCol[3]`}\left(1-`r format(round(mean(as.numeric(MDC[[3]])),3), scientific = FALSE, nsmall = 3)`\right)\approx`r format(round(d[3],3), scientific = FALSE, nsmall = 3)`
+\end{equation}
+
+Continuando, tenemos que
+
+```{r,eval=T}
+# Define the maximum number of elements per line
+max_per_line <- 30
+rounded_d <- format(round(d,3), scientific = FALSE, nsmall = 3)
+
+# Split the vector into segments
+split_vector <- split(rounded_d, ceiling(seq_along(rounded_d) / max_per_line))
+
+# Create a LaTeX-friendly format
+formatted_vector <- sapply(split_vector, function(x) paste(x, collapse = ','))
+#formatted_vector <- sapply(formatted_vector, function(x) paste(x,","))
+
+# Format the output with square brackets and large brackets
+latex_output <- paste("[", paste(formatted_vector, collapse = ', \\\\\n &\\qquad\\qquad'), "]")
+```
+
+\begin{equation}
+  \begin{split}
+    \mathbf{c} &\approx
+    `r latex_output`.
+  \end{split}
+\end{equation} 
+
+Efectivamente, al evaluar de esta forma $\mathbf{c}$, nos permitimos hacer simultáneamente un PCA ponderado tanto para las variables continuas como a cada grupo de variables categóricas.
+
+Aun con esta métrica, los grupos pueden diferir sustancialmente en la magnitud de su primera dimensión. 
+Esto puede sesgar el análisis a favor de los grupos más grandes.
+Para corregirlo, el MFA introduce una ponderación adicional por grupo.
+
+Sea $\lambda_{1,[n]}$ el primer eigenvalor obtenido al aplicar: 
+
+- un PCA a $\mathbf{Y}_{[n]}$ si el grupo es cuantitativo, 
+- un MCA a $\mathbf{Y}_{[n]}$ si es cualitativo.
+
+Cada columna $k$ se reescala entonces mediante: 
+$$
+a_k = \frac{c_k}{\sqrt{\lambda_{1,[n(k)]}}}
+$$
+donde $\sqrt{\lambda_{1,[n(k)]}}$ es el inverso multiplicativo del primer valor singular obtenido de analizar la tabla $n(k)$.
+
+Este paso se precisamente el que diferencia el MFA de otros métodos de reducción de dimensiones. Éste garantiza que la primera dimensión de cada grupo tenga longitud unitaria, impidiendo que un grupo domine el análisis global por su varianza interna o su número de variables.
+
+### PCA a grupos numéricos
+
+En el caso de *Poison*, sólo el primer grupo $\mathbf{Y}_{[1]}$ es de variables numéricas. Entonces le aplicamos un PCA para recuperar $\lambda_{1,[1]}$, a la que vincularemos a las columnas 1 y 2 como valores $\lambda_1$ y $\lambda_2$ y las guardaremos en el vector $\boldsymbol{\lambda}$. 
+En este caso, $\lambda_{1}=\lambda_{2}\approx`r format(round(preLambda[[1]],3), scientific = FALSE, nsmall = 3)`$.
+
+### MCA a grupos categóricos
+
+Aplicando un MCA a cada grupo categórico, también vinculamos el primer eigenvalor con cada columna de éste. 
+Entonces, en el segundo grupo, tenemos que $\lambda_{1,[2]}=\lambda_3=\lambda_4=\lambda_5=\lambda_6\approx`r format(round(preLambda[[2]],2), scientific = FALSE, nsmall = 4)`$\footnote{Nótese que $k=3,\dots,6$ porque hay un total de 4 categorías en las 2 variables del segundo grupo, como se ve en la representación de $\bm{Y}'$}, y continuamos con el mismo método para obtener los demás eigenvalores en el resto de los grupos:
+
+```{r,eval=T}
+# Define the maximum number of elements per line
+max_per_line <- 30
+rounded_lambda <- format(round(Lambda,3), scientific = FALSE, nsmall = 3)
+
+# Split the vector into segments
+split_vector <- split(rounded_lambda, ceiling(seq_along(rounded_lambda) / max_per_line))
+
+# Create a LaTeX-friendly format
+formatted_vector <- sapply(split_vector, function(x) paste(x, collapse = ','))
+#formatted_vector <- sapply(formatted_vector, function(x) paste(x,","))
+
+# Format the output with square brackets and large brackets
+latex_output <- paste("[", paste(formatted_vector, collapse = ', \\\\\n &\\qquad\\qquad'), "]")
+```
+
+\begin{equation}
+  \begin{split}
+    \boldsymbol{\lambda} &\approx
+    `r latex_output`
+  \end{split}
+\end{equation}
+
+Con ello, calculamos el vector de pesos de las variables:
+
+```{r,eval=T}
+# Define the maximum number of elements per line
+max_per_line <- 30
+rounded_a <- format(round(a,3), scientific = FALSE, nsmall = 3)
+
+# Split the vector into segments
+split_vector <- split(rounded_a, ceiling(seq_along(rounded_a) / max_per_line))
+
+# Create a LaTeX-friendly format
+formatted_vector <- sapply(split_vector, function(x) paste(x, collapse = ','))
+#formatted_vector <- sapply(formatted_vector, function(x) paste(x,","))
+
+# Format the output with square brackets and large brackets
+latex_output <- paste("[", paste(formatted_vector, collapse = ', \\\\\n &\\qquad\\qquad'), "]")
+```
+
+\begin{equation}
+  \begin{split}
+    \mathbf{a}& \approx`r latex_output`
+  \end{split}
+\end{equation}
+
+### Construcción de la matriz ponderada
+
+El MFA *per se* consiste finalmente en aplicar un PCA ponderado a la matriz transformada $\mathbf{Y}^*$ cuyo elemento genérico es:
+
+$$
+Y'^*_{ij}=Y'_{ij}\sqrt{r_ia_j}.
+$$
+
+El resultado es: 
+
+- un conjunto de ejes factoriales comunes, 
+- las coordenadas de los individuos en el espacio reducido, 
+- las cargas de variables y categorías, y
+- los eigenvalores que cuantifican la inercia explicada.
+
+Estas cantidades se interpretan de manera análoga a las del PCA o MCA, pero reflejan un compromiso equilibrado entre los distintos grupos.
+
+Entonces, para *Poison* tenemos que $\mathbf{Y}^*$ es:
+
+```{r, eval=T}
+Y_ast <- w%*%t(a)*tab.disjonctif(poison)
+Y_11ast <- Y_ast[poison$Age<13,1:cumsum(Kn)[1]]
+Y_12ast <- Y_ast[poison$Age<13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Y_13ast <- Y_ast[poison$Age<13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Y_14ast <- Y_ast[poison$Age<13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+Y_21ast <- Y_ast[poison$Age>=13,1:cumsum(Kn)[1]]
+Y_22ast <- Y_ast[poison$Age>=13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Y_23ast <- Y_ast[poison$Age>=13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Y_24ast <- Y_ast[poison$Age>=13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+
+```{r latex_Yast, eval=T}
+Yast <- list(
+  stratum1 = list(Y_11ast, Y_12ast, Y_13ast, Y_14ast),
+  stratum2 = list(Y_21ast, Y_22ast, Y_23ast, Y_24ast)
+)
+latex_Yast <- lapply(Yast, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: Y*[1,s], s = 1,...,4</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Y11ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[1,1]}\approx&
+      \left[`r latex_Yast[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y12ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[1,2]}\approx&
+      \left[`r latex_Yast[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y13ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[1,3]}\approx&
+      \left[`r latex_Yast[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y14ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[1,4]}\approx&
+      \left[`r latex_Yast[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: Y*[2,s], s = 1,...,4</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Y21ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[2,1]}\approx&
+      \left[`r latex_Yast[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y22ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[2,2]}\approx&
+      \left[`r latex_Yast[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y23ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[2,3]}\approx&
+      \left[`r latex_Yast[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Y24ast}
+    \begin{split}
+      \mathbf{Y}^{\ast\intercal}_{[2,4]}\approx&
+      \left[`r latex_Yast[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+```{r, eval=TRUE}
+# Extract loadings
+loadings <- GlobPCApoison$var$coord
+```
+
+#### Varianza explicada por las dimensiones principales
+
+-   La primera dimensión explica el
+    **`r format(round(GlobPCApoison[["eig"]][1,2],3), scientific = FALSE, nsmall = 3)`%** de la varianza.
+-   La segunda, el **`r format(round(GlobPCApoison[["eig"]][2,2],3), scientific = FALSE, nsmall = 3)`%**.
+-   La tercera, el **`r format(round(GlobPCApoison[["eig"]][3,2],3), scientific = FALSE, nsmall = 3)`%**.
+-   La cuarta, el **`r format(round(GlobPCApoison[["eig"]][4,2],3), scientific = FALSE, nsmall = 3)`%**.
+-   La quinta, el **`r format(round(GlobPCApoison[["eig"]][5,2],3), scientific = FALSE, nsmall = 3)`%**, sumando
+    una cobertura total de
+    **`r format(round(GlobPCApoison[["eig"]][5,3],3), scientific = FALSE, nsmall = 3)`%**.
+
+En la figura siguiente, observamos un *screeplot* en el que
+el codo aparece en la primera dimensión, lo que sugiere que conservar
+una o dos dimensiones es suficiente. Sin embargo, para fines
+ilustrativos, se conservaron las primeras $S=5$ dimensiones, alcanzando
+una cobertura superior al 70%.
+
+```{r screeplotGlobale, eval=TRUE, fig.cap='Gráfica de codo del MFA sobre la base de datos Poison'}
+fviz_screeplot(GlobPCApoison) +
+  labs(
+    title = "Diagrama de Codo",  # Change the title to Spanish
+    x = "Dimensiones",  # Change the x-axis label
+    y = "Varianza Explicada"  # Change the y-axis label
+  )
+```
+```{r loadingsPoison,eval=TRUE, fig.cap='Cargas del MFA sobre la base de datos Poison.'}
+# Display variable loadings (eigenvectors)
+knitr::kable(
+  format(round(loadings,3), scientific = FALSE, nsmall = 3), 
+  caption = "Cargas del MFA sobre la base de datos Poison", 
+  booktabs = TRUE,
+  valign = 't'
+)
+```
+
+```{r heatmapPoison, eval=TRUE, fig.cap='Mapa de calor de las cargas del MFA aplicado a Poison'}
+# Reshape loadings into a long format for ggplot2
+loadings_long <- melt(loadings)
+colnames(loadings_long) <- c("Variable", "PC", "Loading")
+
+# Plot the heatmap using ggplot2
+ggplot(loadings_long, aes(x = PC, y = Variable, fill = Loading)) +
+  geom_tile() + 
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  theme_minimal() +
+  labs(title = "Mapa de calor de las cargas", x = "Dimensiones", y = "Variables") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+#### Interpretación de las dimensiones principales de la tabla de *loadings*
+
+1.  **Primera dimensión (Enfermedad):**
+    -   Asociada principalmente a síntomas como **diarrea**, **fiebre**,
+        **dolor abdominal** y el diagnóstico de **enfermo**.
+    -   También tiene cargas fuertes para alimentos como **mayonesa** y
+        **queso** (positivas) y sus valores negativos (negativas).
+    -   Interpretación: Podría sugerir que la intoxicación se relaciona
+        con el consumo de **mayonesa** y **queso**.
+2.  **Segunda dimensión (Hábitos de consumo y edad):**
+    -   Altas cargas en la variable **Edad**, la abstención de
+        **pescado** y un consumo moderado de **helado**.
+    -   Interpretación: Representa diferencias de hábitos alimenticios
+        según la edad.
+3.  **Tercera dimensión (Sexo y consumo):**
+    -   Cargas mayores para **mujeres**, consumo de **papas**,
+        abstención de **calabacines** y **helado**.
+    -   Interpretación: Podría estar vinculada con hábitos alimenticios
+        específicos del personal femenino.
+4.  **Cuarta dimensión (Hombres y calabacines):**
+    -   Altas cargas en **hombres**, abstención de **calabacines**,
+        **vómito** y consumo de **papas**.
+    -   Interpretación: Representa patrones alimenticios de un grupo
+        específico de hombres.
+5.  **Quinta dimensión (Papas y helado):**
+    -   Relacionada principalmente con el consumo de **papas** y
+        **helado**.
+    -   Interpretación: Dimensión menos interpretable debido a la
+        dispersión de sus variables.
+
+#### Observaciones de individuos
+
+```{r biplotPoison,eval=TRUE,fig.cap='Biplot final del MFA sobre la base de datos Poison'}
+plot(result)
+```
+
+En el *biplot* anterior: 
+
+
+
+- Se identifican **dos grupos principales** alineados con la primera dimensión: 
+  - **Derecha:** Individuos enfermos, con altas cargas en síntomas. 
+  - **Izquierda:** Individuos sanos. 
+- Individuos atípicos: 
+  - Observados en el eje vertical (segunda dimensión), con tendencia a ser mayores. 
+  - El individuo más atípico es **50**, quien no consume pescado.
+
+#### Conclusión
+
+El análisis confirma que la primera dimensión, asociada a la enfermedad, es la más relevante para interpretar los datos. 
+Aunque se conservaron cinco dimensiones para este ejemplo, una o dos dimensiones serían suficientes para un análisis práctico e interpretable.
+
+# Datos perdidos
+
+El análisis MFA anterior asumió datos completos. En la práctica, sin embargo, las bases de datos suelen llegar a nosotros con valores ausentes. Digamos que para *Poison* la cafetería, la administración y la enfermería no registraron los mismos niños con la misma exhaustividad. Antes de poder aplicar MFA, necesitamos entender qué tipo de ausencias tenemos y cómo imputarlas sin distorsionar la estructura que acabamos de describir.
+
+Como se puede ver en la sección anterior, el Análisis Factorial Múltiple requiere una tabla de datos completa. 
+En presencia de valores faltantes, no es posible aplicar MFA directamente sin introducir sesgos mediante eliminación de individuos o variables. 
+En consecuencia, resulta necesario imputar los datos faltantes como paso previo al análisis factorial.
+
+El método de **Imputación mediante Análisis Factorial Múltiple Regularizado Iterativo (RIMFA)**, propuesto por Josse y Husson [@josse_handling_2012; @josse_missmda_2016], aborda este problema utilizando el propio MFA como herramienta interna de reconstrucción.
+RIMFA produce una única imputación y está diseñado para generar valores coherentes con la estructura factorial inducida por los grupos de variables.
+
+En esta sección se presenta la formulación de RIMFA como base técnica para la extensión a imputación múltiple desarrollada posteriormente.
+
+### Notación y planteamiento del problema
+
+Denotemos por $\mathbf{Y}\in\mathbb{R}^{I\times J}$ la matriz de datos completa (no observada) y por $\mathbf{X}\in\mathbb{R}^{I\times J}$ la matriz de datos observados, que coincide con $\mathbf{Y}$ en las entradas observadas y contiene valores faltantes en el resto. 
+Introducimos la matriz indicadora de observación $\mathbf{R}\in\mathbb{R}^{I\times J}$, definida elemento a elemento como: 
+$$
+r_{ij} =
+\begin{cases}
+1, & \text{si } x_{ij} \text{ es observado},\\
+0, & \text{si } x_{ij} \text{ es faltante}.
+\end{cases}
+$$
+
+En lo que sigue, todas las operaciones las realizaremos sobre la MDC de datos observados: $\mathbf{X}'\in\mathbb{R}^{I\times K}$, construida como en la sección anterior, pero con valores faltantes.
+
+Antes de seguir, necesitamos obtener $\mathbf{X}$, lo que haremos mediante la amputación de los datos originales $\mathbf{Y}$.
+Hay muchas formas de amputar los datos, cada una llamada un mecanismo de pérdida.
+De este mecanismo depende el desempeño y propiedad de un método de imputación.
+En esta sección se analizan los mecanismos de pérdida bajo los cuales RIMFA resulta aplicable, utilizando la taxonomía extendida de Jackson et al. [-@jackson_complete_2023], y se discuten sus limitaciones en contextos más complejos.
+
+### Clasificación de los patrones de pérdida
+
+Un patrón de pérdida se describe mediante la matriz indicadora $\mathbf{R}$ y puede depender de:
+
+- los valores observados $\mathbf{X}$,
+- los valores no observados $\mathbf{X}^c=\mathbf{Y}\smallsetminus\mathbf{X}$, y/o 
+- otros elementos de $\mathbf{R}$.
+
+De acuerdo con Jackson et al., los mecanismos pueden clasificarse según dos ejes principales:
+
+1. **Estructura**: no estructurados (U) vs. estructurados (S),
+2. **Intensidad de la dependencia**: fuertemente estructurados (SS) vs. débilmente estructurados (WS).
+
+En lo que sigue, nos enfocamos en los casos relevantes para el uso de RIMFA.
+
+### MCAR estructurado: MCAR-SS y MCAR-WS
+
+#### MCAR-SS
+
+Un patrón MCAR-SS (*Missing Completely at Random, Strongly Structured*) aparece típicamente al integrar varias bases de datos que contienen conjuntos distintos de individuos. 
+En este caso, la ausencia de datos es completamente predecible a partir de la pertenencia de un individuo a una subbase, y las dependencias dentro de $\mathbf{R}$ son deterministas.
+
+Por ejemplo, al integrar cuatro bases con conjuntos distintos de individuos, la matriz combinada presenta ausencias perfectamente predecibles por grupo de pertenencia.
+
+Formalmente:
+\begin{equation}
+\Pr\left(r_{ij}=1 \mid \mathbf{R}_{\smallsetminus r_{ij}}, \mathbf{X}, \psi \right)
+=
+\Pr\left(r_{ij}=1 \mid \mathbf{R}_{\smallsetminus r_{ij}}, \psi \right)=\{0,1\},
+\end{equation}
+donde $r_{ij}$ es el valor $i,j$ de $\mathbf{R}$ y $\mathbf{R}_{\smallsetminus r_{ij}}$ representa las celdas de $\mathbf{R}$ que no son $r_{ij}$, $\psi$ representa los parámetros del mecanismo de pérdida, y $\mathbf{X}$ es la matriz de datos observados.
+
+Desde un punto de vista computacional, RIMFA es capaz de manejar este tipo de pérdida. 
+Sin embargo, estudios previos [@voillet_handling_2016] indican que, en este contexto específico, métodos diseñados explícitamente para MCAR-SS, como MIMFA, tienden a reconstruir con mayor precisión la distribución original.
+
+Por esta razón, aunque RIMFA es aplicable a MCAR-SS, **no debe considerarse el método preferente** en este escenario.
+
+#### MCAR-WS
+
+Cuando las bases originales presentan pérdida no estructurada (MCAR-U), la combinación de dichas bases puede inducir un patrón MCAR-WS (*Weakly Structured*). En este caso, existen dependencias entre ausencias, pero estas no son deterministas.
+
+Un ejemplo de este caso puede observarse al comparar la parte superior de la tabla siguiente, que ilustra MCAR-U en bases individuales, con la parte inferior, que muestra el patrón MCAR-WS tras la combinación.
+
+
+
+
+```{r, eval=TRUE, include=FALSE}
+db1 <- data.frame(
+  ID = 1:5,
+  Nombre = c("Ana", "Bruno", "Carlos", "David", "Elena"),
+  Edad = c(25, 30, 35, 40, 45),
+  Género = c("F", "M", "M", "M", "F")
+)
+db2 <- data.frame(
+  ID = c(1, 3, 5),
+  Altura = c(160, 168, 155),
+  Peso = c(60, 70, 50),
+  PresiónSanguínea = c("120/80", "125/75", "115/70")
+)
+db3 <- data.frame(
+  ID = c(1, 2, 4, 5),
+  Ocupación = c("Ingeniero", "Doctor", "Científico", "Maestro"),
+  Ingreso = c(60000, 120000, 90000, 50000)
+)
+db4 <- data.frame(
+  ID = c(2, 3, 4),
+  Título = c("MFA", "MFA", "Doctor"),
+  Universidad = c("Universidad B", "Universidad C", "Universidad D")
+)
+```
+
+```{r, eval=TRUE}
+# Function to randomly introduce MCAR missing data
+introduce_mcar <- function(df, missing_rate = 0.2) {
+  # Get the number of rows and columns in the dataset
+  df <- as.matrix(df)
+  nrows <- nrow(df)
+  ncols <- ncol(df)
+  
+  # Calculate the total number of missing values to introduce
+  n_missing <- format(round(nrows * ncols * missing_rate), scientific = FALSE, nsmall = 4)
+  
+  # Get the positions of the missing data
+  missing_positions <- sample(1:(nrows * ncols), n_missing)
+  
+  # Introduce missing data at the selected positions
+  df[missing_positions] <- NA
+  df <- as.data.frame(df)
+  
+  return(df)
+}
+
+
+# Introduce MCAR missing data to each dataset
+db1_mcar <- introduce_mcar(db1, missing_rate = 0.1)
+db2_mcar <- introduce_mcar(db2, missing_rate = 0.1)
+db3_mcar <- introduce_mcar(db3, missing_rate = 0.1)
+db4_mcar <- introduce_mcar(db4, missing_rate = 0.1)
+
+# Compile the datasets by merging them on "ID", using full_join to include all individuals
+compiled_db_MCAR_WS <- db1_mcar %>%
+  full_join(db2_mcar, by = "ID") %>%
+  full_join(db3_mcar, by = "ID") %>%
+  full_join(db4_mcar, by = "ID")
+
+```
+
+```{r simIndivMCARU, eval=TRUE}
+# Display the original datasets with MCAR missing data side by side
+knitr::kable(
+  list(db1_mcar, db2_mcar, db3_mcar, db4_mcar), 
+  caption = "Bases de dato de juguete amputadas al 10\\% de datos faltantes mediante mecanismo MCAR-U",
+  booktabs = TRUE,
+  valign = 't'
+)
+```
+
+```{r colIndivMCARWS, eval=TRUE}
+# Display the compiled dataset with MCAR missing data side by side
+knitr::kable(
+  compiled_db_MCAR_WS, 
+  caption = "Base de datos compilada a partir de bases previas amputadas mediante mecanismo MCAR-U y con resultado MCAR-WS",
+  booktabs = TRUE,
+  valign = 't'
+) %>%
+kable_styling(latex_options = "scale_down")
+```
+
+Matemáticamente:
+\begin{equation}
+\Pr\left(r_{ij}=1 \mid \mathbf{R}_{\smallsetminus r_{ij}}, \mathbf{X}, \psi \right)
+=
+\Pr\left(r_{ij}=1 \mid \mathbf{R}_{\smallsetminus r_{ij}}, \psi \right)\in(0,1),
+\end{equation}
+pero con variabilidad en $\mathbf{R}$.
+
+Este es **el escenario para el cual RIMFA fue concebido**. La reconstrucción factorial aprovecha la estructura conjunta inducida por los grupos, y la regularización permite estabilizar la imputación aun cuando las dependencias entre ausencias no sean perfectamente predecibles.
+
+### MNAR: alcance y limitaciones
+
+Un mecanismo MNAR (Missing Not at Random) ocurre cuando la probabilidad de ausencia depende de valores no observados:
+\begin{equation}
+\Pr\left(r_{ij}=1 \mid \mathbf{R}_{\smallsetminus r_{ij}}, \mathbf{X}, \psi \right)
+=
+\Pr\left(r_{ij}=1 \mid \mathbf{X}^c, \psi \right).
+\end{equation}
+
+En el contexto de RIMFA, es importante distinguir entre distintos tipos de sesgo MNAR:
+
+- **Sesgo de desplazamiento**: los valores faltantes presentan una media distinta a la de los observados, pero una dispersión comparable.
+- **Sesgo de escala**: los valores faltantes difieren principalmente en varianza.
+- **Sesgo de forma**: los valores faltantes siguen una distribución completamente distinta a los observados
+
+RIMFA puede ser utilizado en presencia de **MNAR con sesgo de desplazamiento**, siempre que exista un solapamiento sustancial entre los rangos de valores observados y no observados. En cambio, no ofrece herramientas para abordar MNAR con sesgos de escala o forma.
+
+### Uso de pesos y desplazamiento en contextos MNAR
+
+En escenarios MNAR con sesgo de desplazamiento, RIMFA permite introducir ajustes informados por conocimiento de área mediante dos mecanismos complementarios.
+
+#### Desplazamiento de la media ($\delta$)
+
+El sesgo de desplazamiento puede modelarse añadiendo un término $\delta$ a los valores imputados, ajustado mediante análisis de sensibilidad. Este parámetro no se estima automáticamente, sino que se selecciona en función de hipótesis plausibles sobre el mecanismo de pérdida.
+
+#### Pesos de filas ($\mathbf{r}$)
+
+El vector de pesos $\mathbf{r}$ controla la influencia relativa de los individuos en el MFA interno y, por tanto, en la reconstrucción de los valores faltantes. Ajustar $\mathbf{r}$ permite sesgar la imputación hacia subpoblaciones específicas, siempre que los rangos de valores observados y no observados se superpongan.
+
+Es importante destacar que ni $\delta$ ni $\mathbf{r}$ permiten tratar MNAR-SS, ya que en ese caso no existe información observada en el rango relevante para la imputación.
+
+### Síntesis
+
+En resumen:
+
+- RIMFA es plenamente compatible con mecanismos MCAR-WS.
+- Es computacionalmente aplicable, pero no óptimo, en MCAR-SS.
+- Puede utilizarse de forma controlada en ciertos casos de MNAR-WS con sesgo de desplazamiento.
+- No es adecuado para MNAR con sesgos de escala o forma.
+
+Con esto, podemos regresar a discutir el siguiente escenario.
+Imaginemos el siguiente escenario:
+La cafetería, la administración escolar y la enfermería tienen sus propios registros, pero cada una perdió datos sobre ciertos niños de forma independiente. Además, en la cafetería, el responsable suele no escribir qué comen los niños si se le hace común, pero su idea de qué es común está basada en qué suelen comer los adultos. 
+
+Entonces tenemos dos mecanismos de pérdida de datos uno encima del otro: una pérdida que depende del mismo valor del dato perdido (Pérdida no aleatoria, MNAR) y otra que depende de si otros datos son faltantes (Pérdida estructurada). Este tipo de pérdidas son comunes en datos administrativos y discutiremos más adelante en la sección de "Métodos" su naturaleza y propiedades. 
+
+Para simular esta situación, modelaré los mecanismos de pérdida para obtener la base de datos observados $\mathbf{X}$ de la siguiente manera:
+
+#### 1. Pérdida MNAR por sesgo de desplazamiento:
+
+La matriz $\mathbf{Y}$ está dividida en dos estratos basados en la edad de
+los individuos:
+
+-   $\mathbf{Y}_{[1,\cdotp]}$: Menores de 12 años.
+
+-   $\mathbf{Y}_{[2,\cdotp]}$: 13 años o más.
+
+Suponemos que los investigadores asumieron que lo normal es comer como adulto por lo que frecuentemente olvidaron registrar
+datos considerados típicos en adultos. Esto introduce un sesgo de
+desplazamiento alejándose de los valores típicos para adultos. En este
+caso, la probabilidad de que un dato falte depende del valor del propio
+dato (MNAR). Específicamente, si un valor es cercano al típico del
+segundo estrato ($\text{C}(\mathbf{Y}_{[2,\cdotp]j})$), es más probable
+que sea omitido.
+
+El valor típico para cada variable $j$ se define como:
+
+-   **Media** para variables continuas.
+
+-   **Moda** para variables categóricas.
+
+Matemáticamente, podemos expresar el modelo como:
+
+\begin{equation}
+\Pr{(r_{ij}=0)} = f\left(\left|y_{ij} - \text{C}(\mathbf{Y}_{[2,\cdotp]j})\right|\right),
+\end{equation}
+
+donde:
+
+-   $r_{ij}=0$ indica que el dato $x_{ij}$ es faltante y $r_{ij}=1$ indicaría que $x_{ij}$ es observado y por lo tanto corresponde al dato $y_{ij}$.
+
+-   $f:\mathbb{R}\rightarrow [0,1]$ es una función que tiende a uno si $\left|y_{ij} - \text{C}(\mathbf{Y}_{[2,\cdotp]j})\right|$ tiende a cero (dato cercano al valor típico, mayor probabilidad de omisión) y tiende a cero si $\left|y_{ij} - \text{C}(\mathbf{Y}_{[2,\cdotp]j})\right| \gg 0$ (dato atípico, menor probabilidad de omisión).
+
+#### 2. Pérdida estructurada:
+
+Además del mecanismo MNAR, simulamos un escenario en el que ciertos
+grupos de variables tienen valores faltantes debido a diferencias en
+cómo se recolectaron los datos. Esta pérdida, asumida como aleatoria dentro de los grupos, refleja las limitaciones típicas de los registros históricos, dando lugar a una pérdida estructurada. 
+
+La combinación de estos mecanismos resulta en una estructura de pérdida MNAR débilmente estructurada (MNAR-WS), ya que la presencia o ausencia de un dato no es perfectamente predecible, pero si un dato falta para un individuo, es muy probable que otros datos del mismo individuo falten. Entonces, añadiendo este proceso, tenemos:
+
+\begin{equation}
+\Pr{(r_{ij}=0)} = f\left(\left|y_{ij} - \text{C}(\mathbf{Y}_{[2,\cdotp]j})\right|\right) \cdot g\left(r_{i,-j}\right),
+\end{equation}
+
+donde:
+
+-   $g:\{0,1\}\rightarrow [0,1]$ es una función del estatus faltante o no de otros datos de la misma observación ($r_{i,-j}$).
+
+```{r, eval=TRUE}
+missing_goal <- 0.1
+```
+```{r, eval=TRUE}
+
+groups <- list(1:2,3:4,5:9, 10:15)
+
+# Central Tendency Calculation
+best_central_tendency_all <- function(data) {
+  calc_central_tendency <- function(variable) {
+    if (is.numeric(variable)) {
+      skewness_val <- skewness(variable, na.rm = TRUE)
+      if (abs(skewness_val) < 0.5) {
+        return(mean(variable, na.rm = TRUE))
+      } else {
+        return(median(variable, na.rm = TRUE))
+      }
+    } else if (is.factor(variable) || is.character(variable)) {
+      mode_value <- names(sort(table(variable), decreasing = TRUE))[1]
+      return(mode_value)
+    } else {
+      return(NA)
+    }
+  }
+  return(sapply(data, calc_central_tendency))
+}
+
+c_adults <- best_central_tendency_all(Y2dot)
+compute_prob <- function(value, central_tendency) {  
+  if (is.numeric(value)) {    
+    diff <- abs(value - as.numeric(central_tendency))    
+    prob <- 1 / (1 + diff)  
+    } else if (is.factor(value)) {    
+      prob <- ifelse(value == central_tendency, 0.8, 0.2)  
+      } else {    
+        prob <- 0  
+        }  
+  return(prob)
+}
+
+scale_probs <- function(probs, target_missingness) {  
+  probs_scaled <- probs / sum(probs) * target_missingness * length(probs)  
+  return(pmin(probs_scaled, 1))
+  }
+ampute_data <- function(data, central_tendencies, target_missingness) {  
+  data_amputed <- data  
+  for (var in names(data)) {    
+    central_tendency <- central_tendencies[[var]]    
+    probs <- sapply(data[[var]], 
+                    compute_prob, 
+                    central_tendency = central_tendency)    
+    probs <- scale_probs(probs, target_missingness)    
+    to_ampute <- runif(length(probs)) < probs    
+    data_amputed[[var]][to_ampute] <- NA  
+    }  
+  return(data_amputed)
+}
+# Weighted Mean Function
+weighted_mean <- function(x, weights) {
+  weighted.mean(x, weights, na.rm = TRUE)
+}
+
+calc_missing_percentage <- function(data) {
+  return(sum(is.na(data)) / (nrow(data) * ncol(data)))
+}
+
+compute_prob <- function(value, central_tendency) {
+  if (is.numeric(value)) {
+    diff <- abs(value - as.numeric(central_tendency))
+    prob <- 1 / (1 + diff)
+  } else if (is.factor(value)) {
+    prob <- ifelse(value == central_tendency, 0.8, 0.2)
+  } else {
+    prob <- 0
+  }
+  return(prob)
+}
+
+ampute_structured <- function(data, groups, target_missingness) {
+  if (target_missingness <= 0) {
+    return(data)  # It is unnecessary to impute more data
+  }
+  
+  data_amputed <- data
+  for (group in groups) {
+    # Choose rows for this group
+    rows_to_ampute <- sample(1:nrow(data), size = ceiling(target_missingness * nrow(data)))
+    data_amputed[rows_to_ampute, group] <- NA
+  }
+  return(data_amputed)
+}
+
+
+combine_amputation_split <- function(data, central_tendencies, target_missingness, groups, split_ratio = 0.5) {
+  # Split target missingness
+  target_missingness_mnar <- target_missingness * split_ratio
+  target_missingness_ws <- target_missingness * (1 - split_ratio)
+  
+  # 1. Apply MNAR mechanism
+  data_mnar <- ampute_data(data, central_tendencies, target_missingness_mnar)
+  
+  # 2. Recalculate the remaining missingness quota
+  missing_percentage_mnar <- calc_missing_percentage(data_mnar)
+  remaining_missingness <- target_missingness - missing_percentage_mnar
+  
+  # 3. Apply WS mechanism to add the remaining missingness
+  if (remaining_missingness > 0) {
+    data_combined <- ampute_structured(data = data_mnar, groups = groups, target_missingness = remaining_missingness)
+  } else {
+    warning("Target missingness already reached after MNAR mechanism. No further WS missingness added.")
+    data_combined <- data_mnar
+  }
+  
+  return(data_combined)
+}
+
+
+data_amputed <- combine_amputation_split(
+  data = poison,
+  central_tendencies = c_adults,
+  target_missingness = missing_goal,
+  groups = groups,
+  split_ratio = 0.5  # Adjust this ratio as needed
+)
+
+data_amputed[,1:2] <- poison[,1:2]
+
+colnames(data_amputed) <- colnames(poison)
+
+# MFA Preparation
+w <- ifelse(poison$Age < 13, 1, 2)
+w <- w / sum(w)
+R <- is.na(data_amputed)
+percent_miss <- calc_missing_percentage(data_amputed)
+```
+
+```{r missingPoison,eval=TRUE, fig.cap='Estructura de datos faltantes para la base de datos Poison'}
+vis_miss(data_amputed)
+```
+
+Con este criterio, y con una meta de tener un `r missing_goal*100`% de datos faltantes, obtuve la distribución de datos faltantes que se ve en la gráfica anterior. 
+El proceso de amputado es aleatorio y no consiguió exactamente, `r missing_goal*100`%, sino `r percent_miss*100`%.
+Esto no afecta el análisis.
+Más importante es ver cómo en el eje horizontal hay dependencias dentro de los renglones, pero no son absolutas.
+En el vertical, exceptuando los renglones faltantes, los datos faltantes suelen estar en la parte inferior de la matriz, correspondiente a los adultos. 
+Esto corresponde a la estructura MNAR definida antes.
+
+Explicación resumida:
+
+El mecanismo de pérdida combina dos características clave:
+
+-   MNAR: La probabilidad de pérdida depende del propio valor del dato y
+    se centra en valores cercanos al típico de adultos.
+
+-   WS: La pérdida incluye un componente estructurado basado en grupos
+    de variables, imitando cómo se recopilan los datos en la práctica.
+
+Como resultado, $\Pr{(r_{ij}=0)}$ depende tanto del valor del dato como
+de la presencia o ausencia de otros datos en el mismo individuo
+($r_{i,-j}$), creando una estructura compleja pero realista de datos
+faltantes.
+
+```{r, eval=TRUE, results='hide'}
+# Prepare CDT (Complete Disjunctive Table)
+CDT <- dummy_cols(data_amputed, ignore_na = TRUE, remove_selected_columns = TRUE)
+Rprime <- is.na(CDT)
+
+# Initial Imputation
+X0num <- CDT[, 1:2]
+X0num[is.na(X0num)] <- 0
+
+X0cat <- CDT[, 3:ncol(CDT)]
+X0cat[] <- lapply(X0cat, function(col) {
+  weighted_col_mean <- weighted_mean(col, w)
+  ifelse(is.na(col), weighted_col_mean, col)
+})
+
+X0 <- cbind.data.frame(X0num, X0cat)
+
+X_11 <- X0[X0$Age<13,1:Kn[1]]
+X_12 <- X0[X0$Age<13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+X_13 <- X0[X0$Age<13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+X_14 <- X0[X0$Age<13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+X_21 <- X0[X0$Age>=13,1:Kn[1]]
+X_22 <- X0[X0$Age>=13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+X_23 <- X0[X0$Age>=13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+X_24 <- X0[X0$Age>=13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+```{r,eval=TRUE}
+# Group Setup
+b <- as.vector(1 - colMeans(X0))
+
+X0groups <- list()
+X0groups[[1]] <- X0num
+X0groups[[2]] <- X0[, (cumsum(Kn)[1] + 1):cumsum(Kn)[2]]
+X0groups[[3]] <- X0[, (cumsum(Kn)[2] + 1):cumsum(Kn)[3]]
+X0groups[[4]] <- X0[, (cumsum(Kn)[3] + 1):cumsum(Kn)[4]]
+
+# MCA to PCA Equivalence
+Ik <- list()
+Ik[[2]] <- pmax(as.numeric(lapply(X0groups[[2]], sum)), 1e-16)
+Ik[[3]] <- pmax(as.numeric(lapply(X0groups[[3]], sum)), 1e-16)
+Ik[[4]] <- pmax(as.numeric(lapply(X0groups[[4]], sum)), 1e-16)
+
+c <- list()
+c[[2]] <- nrow(poison) / Jn[2] / Ik[[2]]
+c[[3]] <- nrow(poison) / Jn[3] / Ik[[3]]
+c[[4]] <- nrow(poison) / Jn[4] / Ik[[4]]
+
+X0eq <- list()
+X0eq[[1]] <- X0groups[[1]]
+X0eq[[2]] <- t(t(X0groups[[2]]) * c[[2]])
+X0eq[[3]] <- t(t(X0groups[[3]]) * c[[3]])
+X0eq[[4]] <- t(t(X0groups[[4]]) * c[[4]])
+
+# Singular Value Computation
+preLambda <- list()
+preLambda[[1]] <- PCA(X0eq[[1]], graph = FALSE)[["eig"]][1, 1]
+preLambda[[2]] <- PCA(X0eq[[2]], graph = FALSE)[["eig"]][1, 2]
+preLambda[[3]] <- PCA(X0eq[[3]], graph = FALSE)[["eig"]][1, 2]
+preLambda[[4]] <- PCA(X0eq[[4]], graph = FALSE)[["eig"]][1, 2]
+
+preLambda <- unlist(preLambda)
+Lambda <- unlist(lapply(seq_along(Jn), function(i) rep(sqrt(preLambda[i]), Kn[i])))
+
+d <- b / JperCol
+d[1:2] <- 1
+a <- d / Lambda
+
+# Global PCA
+GlobSVDpoison <- svd.triplet(as.data.frame(X0), col.w = a, row.w = w)
+
+# Regularization
+GlobalLambda <- GlobSVDpoison[["vs"]][1:5]
+OtherLambda <- GlobSVDpoison[["vs"]][-(1:5)] %>% na.omit()
+da <- K - sum(Jn[2:4])
+Df <- (I - 1) * da - (I - 1) * 5 - 5 * da + 5^2
+
+sigma2 <- min((I * da / min(da, I - 1)) * (sum(OtherLambda^2) / Df) * 1, OtherLambda[1]^2)
+RegLambda <- (GlobalLambda^2 - sigma2) / GlobalLambda
+```
+
+```{r,eval=TRUE}
+
+
+# Reconstruct Estimated X
+UU <- GlobSVDpoison[["U"]][, 1:5]
+FF <- GlobSVDpoison[["V"]][, 1:5]
+EstimX <- diag(w) %*% UU %*% diag(RegLambda) %*% t(FF) / w
+
+# Initial Imputation
+Ximp <- (1 - Rprime) * X0 + Rprime * EstimX
+```
+
+```{r, eval=T}
+X1 <- as.data.frame(EstimX)
+colnames(X1) <- colnames(CDT)
+X1_11 <- X1[X1$Age<13,1:Kn[1]]
+X1_12 <- X1[X1$Age<13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+X1_13 <- X1[X1$Age<13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+X1_14 <- X1[X1$Age<13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+X1_21 <- X1[X1$Age>=13,1:Kn[1]]
+X1_22 <- X1[X1$Age>=13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+X1_23 <- X1[X1$Age>=13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+X1_24 <- X1[X1$Age>=13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+```{r, eval=T}
+X1imp <- as.data.frame(Ximp)
+colnames(X1imp) <- colnames(CDT)
+X1_11imp <- X1imp[X1imp$Age<13,1:Kn[1]]
+X1_12imp <- X1imp[X1imp$Age<13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+X1_13imp <- X1imp[X1imp$Age<13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+X1_14imp <- X1imp[X1imp$Age<13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+X1_21imp <- X1imp[X1imp$Age>=13,1:Kn[1]]
+X1_22imp <- X1imp[X1imp$Age>=13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+X1_23imp <- X1imp[X1imp$Age>=13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+X1_24imp <- X1imp[X1imp$Age>=13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+```{r,eval=TRUE}
+# Iterative MFA
+convergence_threshold <- 1e-6
+max_iterations <- 100
+iteration <- 1
+converged <- FALSE
+
+while (!converged && iteration <= max_iterations) {
+  # Update groups
+  Ximp_groups <- list()
+  Ximp_groups[[1]] <- Ximp[, 1:Jn[1]]
+  Ximp_groups[[2]] <- Ximp[, (cumsum(Jn)[1] + 1):cumsum(Jn)[2]]
+  Ximp_groups[[3]] <- Ximp[, (cumsum(Jn)[2] + 1):cumsum(Jn)[3]]
+  Ximp_groups[[4]] <- Ximp[, (cumsum(Jn)[3] + 1):cumsum(Jn)[4]]
+  
+  # MCA to PCA equivalence (recompute Ik and c)
+  Ik[[2]] <- pmax(as.numeric(lapply(Ximp_groups[[2]], sum)), 1e-16)
+  Ik[[3]] <- pmax(as.numeric(lapply(Ximp_groups[[3]], sum)), 1e-16)
+  Ik[[4]] <- pmax(as.numeric(lapply(Ximp_groups[[4]], sum)), 1e-16)
+  
+  c[[2]] <- nrow(poison) / Jn[2] / Ik[[2]]
+  c[[3]] <- nrow(poison) / Jn[3] / Ik[[3]]
+  c[[4]] <- nrow(poison) / Jn[4] / Ik[[4]]
+  
+  # Adjust Ximp groups
+  Ximp_eq <- list()
+  Ximp_eq[[1]] <- Ximp_groups[[1]]
+  Ximp_eq[[2]] <- t(t(Ximp_groups[[2]]) * c[[2]])
+  Ximp_eq[[3]] <- t(t(Ximp_groups[[3]]) * c[[3]])
+  Ximp_eq[[4]] <- t(t(Ximp_groups[[4]]) * c[[4]])
+  
+  # Recompute singular values
+  preLambda[[1]] <- PCA(Ximp_eq[[1]], graph = FALSE)[["eig"]][1, 1]
+  preLambda[[2]] <- PCA(Ximp_eq[[2]], graph = FALSE)[["eig"]][1, 2]
+  preLambda[[3]] <- PCA(Ximp_eq[[3]], graph = FALSE)[["eig"]][1, 2]
+  preLambda[[4]] <- PCA(Ximp_eq[[4]], graph = FALSE)[["eig"]][1, 2]
+  
+  preLambda <- unlist(preLambda)
+  Lambda <- unlist(lapply(seq_along(Jn), function(i) rep(sqrt(preLambda[i]), Kn[i])))
+  
+  # Recompute weights
+  d <- b / JperCol
+  d[1:2] <- 1
+  a <- d / Lambda
+  
+    # Check for artifacts and remove them
+  all_nan_cols <- colnames(Ximp)[sapply(Ximp, function(x) all(is.na(x)))]
+  targets <- grep("_0$|_1$", all_nan_cols, value = TRUE)
+  for (col in targets){
+    suffix <- if(grepl("_1$",col)) "_0" else "_1"
+    base_name <- sub("_[01]$","",col)
+    counterpart <- paste0(base_name, suffix)
+    if (counterpart %in% colnames(Ximp)) {
+    Ximp[[col]] <- 1 - Ximp[[counterpart]]
+    }
+  }
+  
+  # Perform global PCA
+  GlobSVDpoison <- svd.triplet(as.data.frame(Ximp), col.w = a, row.w = w)
+  
+  # Regularization
+  GlobalLambda <- GlobSVDpoison[["vs"]][1:5]
+  OtherLambda <- GlobSVDpoison[["vs"]][6:length(GlobSVDpoison[["vs"]])] %>% na.omit()
+  da <- K - sum(Jn[2:4])
+  
+  Df <- (I - 1) * da - (I - 1) * 5 - 5 * da + 5^2
+  
+  sigma2 <- min((I * da / min(da, I - 1)) * (sum(OtherLambda^2) / Df) * 1, GlobSVDpoison[["vs"]][6]^2)
+  RegLambda <- (GlobalLambda^2 - sigma2) / GlobalLambda
+  
+  # Reconstruct estimated X
+  UU <- GlobSVDpoison[["U"]][, 1:5]
+  FF <- GlobSVDpoison[["V"]][, 1:5]
+  EstimX_new <- diag(w) %*% UU %*% diag(RegLambda) %*% t(FF) / w
+  
+  # Update Ximp
+  Ximp_new <- (1 - Rprime) * X0 + Rprime * EstimX_new
+  
+  # Check for artifacts and remove them
+  all_nan_cols <- colnames(Ximp_new)[sapply(Ximp_new, function(x) all(is.na(x)))]
+  targets <- grep("_0$|_1$", all_nan_cols, value = TRUE)
+  for (col in targets){
+    suffix <- if(grepl("_1$",col)) "_0" else "_1"
+    base_name <- sub("_[01]$","",col)
+    counterpart <- paste0(base_name, suffix)
+    if (counterpart %in% colnames(Ximp_new)) {
+    Ximp_new[[col]] <- 1 - Ximp_new[[counterpart]]
+    }
+  }
+  
+  # Check for convergence
+  diff <- sum((Ximp_new - Ximp)^2, na.rm = TRUE) / sum(Ximp^2, na.rm = TRUE)
+  converged <- diff < convergence_threshold
+  
+  # Update for the next iteration
+  
+  Ximp <- Ximp_new
+  
+  iteration <- iteration + 1
+}
+
+# Rebuild original matrix from Complete Disjunctive Table (CDT)
+find_category <- function(original_data, tab_disjunctive) {
+  nbdummy <- rep(1, ncol(original_data))
+  is_quali <- which(!unlist(lapply(original_data, is.numeric)))
+  nbdummy[is_quali] <- unlist(lapply(original_data[, is_quali, drop = FALSE], nlevels))
+  vec <- c(0, cumsum(nbdummy))
+  
+  reconstructed_data <- original_data
+  for (i in seq_along(original_data)) {
+    if (i %in% is_quali) {
+      reconstructed_data[, i] <- as.factor(
+        levels(original_data[, i])[apply(tab_disjunctive[, (vec[i] + 1):vec[i + 1]], 1, which.max)]
+      )
+    } else {
+      reconstructed_data[, i] <- tab_disjunctive[, vec[i] + 1]
+    }
+  }
+  return(reconstructed_data)
+}
+
+
+# For each dummy pair _0/_1, enforce mirror constraint using the _1 column as truth
+col_names <- colnames(Ximp)
+base_names <- unique(sub("_[01]$", "", grep("_[01]$", col_names, value = TRUE)))
+
+for (base in base_names) {
+  col1 <- paste0(base, "_1")
+  col0 <- paste0(base, "_0")
+  if (col1 %in% col_names && col0 %in% col_names) {
+    Ximp[, col0] <- 1 - Ximp[, col1]
+  }
+}
+
+# Reconstruct the complete observations
+completeObs <- Ximp
+final_result <- find_category(data_amputed, completeObs)
+```
+
+```{r, eval=T}
+Xf <- as.data.frame(completeObs)
+colnames(Xf) <- colnames(CDT)
+Xf_11 <- Xf[Xf$Age<13,1:Kn[1]]
+Xf_12 <- Xf[Xf$Age<13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xf_13 <- Xf[Xf$Age<13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xf_14 <- Xf[Xf$Age<13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+Xf_21 <- Xf[Xf$Age>=13,1:Kn[1]]
+Xf_22 <- Xf[Xf$Age>=13,(cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xf_23 <- Xf[Xf$Age>=13,(cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xf_24 <- Xf[Xf$Age>=13,(cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+```{r, eval=T}
+FR <- final_result
+FR11 <- FR[FR$Age<13,1:Jn[1]]
+FR12 <- FR[FR$Age<13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+FR13 <- FR[FR$Age<13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+FR14 <- FR[FR$Age<13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+FR21 <- FR[FR$Age>=13,1:Jn[1]]
+FR22 <- FR[FR$Age>=13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+FR23 <- FR[FR$Age>=13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+FR24 <- FR[FR$Age>=13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+```
+
+```{r,eval=TRUE}
+adjusted_RV <- function(X, Y) {
+  # Ensure X and Y are matrices
+  if (!is.matrix(X) || !is.matrix(Y)) stop("X and Y must be matrices")
+  
+  # Dimensions of X and Y
+  n <- nrow(X)
+  p <- ncol(X)
+  q <- ncol(Y)
+  
+  # Ensure p <= q (if not, swap X and Y)
+  if (p > q) {
+    tmp <- X
+    X <- Y
+    Y <- tmp
+    p <- ncol(X)
+    q <- ncol(Y)
+  }
+  
+  # Center the matrices
+  X_centered <- scale(X, center = TRUE, scale = FALSE)
+  Y_centered <- scale(Y, center = TRUE, scale = FALSE)
+  
+  # Covariance matrices
+  Sigma_XX <- (t(X_centered) %*% X_centered) / (n - 1)
+  Sigma_YY <- (t(Y_centered) %*% Y_centered) / (n - 1)
+  Sigma_XY <- (t(X_centered) %*% Y_centered) / (n - 1)
+  
+  # Compute eigenvalues of Sigma_XX and Sigma_YY
+  eigen_X <- eigen(Sigma_XX, symmetric = TRUE)
+  eigen_Y <- eigen(Sigma_YY, symmetric = TRUE)
+  
+  # Diagonal matrices of eigenvalues (sorted decreasingly)
+  Lambda_X <- diag(sort(eigen_X$values, decreasing = TRUE))
+  Lambda_Y <- diag(sort(eigen_Y$values, decreasing = TRUE))
+  
+  # Projection matrix Π
+  Pi <- diag(c(rep(1, p), rep(0, q - p)))
+  
+  # Numerator: Tr(Sigma_XY Sigma_YX)
+  numerator <- sum(diag(Sigma_XY %*% t(Sigma_XY)))
+  
+  # Denominator: Tr(Lambda_X Π Lambda_Y)
+  denominator <- sum(diag(Lambda_X %*% Pi %*% Lambda_Y))
+  
+  # Adjusted RV coefficient
+  adjusted_RV <- numerator / denominator
+  
+  return(adjusted_RV)
+}
+
+RV <- adjusted_RV(as.matrix(Xf), as.matrix(MDC))
+```
+
+```{r,eval=TRUE}
+# Perform MFA on the original dataset
+MFA_poison <- MFA(poison, 
+                  group = c(2, 2, 5, 6), # Adjust groups based on the structure of poison
+                  type = c("s", "n", "n", "n"), # Type of variables: s for numeric, n for categorical
+                  name.group = c("Group1", "Group2", "Group3", "Group4"),
+                  graph = FALSE)
+
+# Perform MFA on the imputed dataset
+MFA_final_result <- MFA(final_result, 
+                        group = c(2, 2, 5, 6), # Same group structure as poison
+                        type = c("s", "n", "n", "n"),
+                        name.group = c("Group1", "Group2", "Group3", "Group4"),
+                        graph = FALSE)
+
+```
+
+# Imputación Simple mediante Análisis Factorial Múltiple Regularizado Iterativo (RIMFA)
+
+Habiendo caracterizado el mecanismo de pérdida que afecta a Poison —MNAR-WS con sesgo de desplazamiento y pérdida estructurada superpuesta— podemos ahora elegir un método de imputación apropiado. 
+RIMFA fue diseñado precisamente para este tipo de mecanismo y utiliza el propio MFA como motor interno de reconstrucción, lo que garantiza coherencia con la estructura agrupada que ya conocemos.
+
+Ahora que tenemos datos faltantes, hacer un análisis multivariado como el de la sección anterior no es posible directamente. Tanto el MFA como otros modelos de reducción de dimensiones exigen que se traten los datos faltantes. 
+Como el análisis apropiado para esta base es el MFA, buscaremos un método que respete las propiedades que éste utiliza. 
+Dicho método es la Imputación Simple mediante Análisis Factorial Múltiple Regularizado Iterativo (RIMFA). 
+Ésta pertenece a una familia de métodos de imputación que buscan preservar la distribución conjunta de los datos, no las condicionales, que típicamente son las preservadas en otros métodos.
+
+### RIMFA como problema de reconstrucción
+
+Recordemos que el MFA puede verse como un PCA ponderado aplicado a una tabla completa. 
+En ausencia de valores faltantes, el PCA busca una aproximación de rango reducido de la forma: 
+\begin{equation}
+\mathbf{Y}' \approx \mathbf{M} + \mathbf{T}\mathbf{W}^\intercal,
+\end{equation} 
+donde $\mathbf{M}$ es la matriz de medias ponderadas, $\mathbf{T}$ contiene las coordenadas de los individuos y $\mathbf{W}$ las cargas de variables y categorías.
+
+Esto es equivalente a decir que queremos minimizar el criterio:
+\begin{equation}
+\left\lVert \mathbf{Y}' - \mathbf{M} - \mathbf{T}\mathbf{W}^\intercal \right\rVert^2,
+\end{equation}
+
+En presencia de datos faltantes, éste se modifica para considerar
+únicamente las entradas observadas: 
+\begin{equation}
+\left\lVert \mathbf{R} \circ \left(\mathbf{X}' - \mathbf{M} - \mathbf{T}\mathbf{W}^\intercal\right) \right\rVert^2,
+\end{equation} 
+donde $\circ$ denota el producto elemento por elemento.
+Desafortunadamente, este problema no admite una solución cerrada y debe resolverse mediante un procedimiento iterativo.
+
+### Esquema iterativo del RIMFA
+
+El algoritmo de RIMFA alterna entre la estimación del subespacio
+factorial y la actualización de los valores faltantes.
+
+#### Inicialización
+
+Se construye una versión inicial $\mathbf{X}'^{(0)}$ reemplazando los valores faltantes por valores arbitrarios.
+Para variables categóricas, estos valores pueden ser reales en $(0,1)$, siempre que respeten la restricción de que, para cada individuo y variable, la suma de las categorías correspondientes sea igual a uno.
+
+Inicialicemos los valores faltantes de *Poison* imputado con valores iniciales arbitrarios que en este caso elijo que sean 0 para datos numéricos y la proporción observada de cada categoría para datos categóricos.
+
+Aunque esta elección es arbitraria, revisaremos su impacto cuando
+introduzcamos la imputación múltiple. Para este ejemplo, dividimos
+$\mathbf{X}'^{(0)}$ en submatrices como se muestra a continuación:
+
+```{r latex_X_amp, eval=T}
+X_amp_list <- list(
+  stratum1 = list(X_11, X_12, X_13, X_14),
+  stratum2 = list(X_21, X_22, X_23, X_24)
+)
+latex_X_amp <- lapply(X_amp_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'(0, amputada)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:X11}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[1,1]}=&
+      \left[`r latex_X_amp[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:X12}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[1,2]}=&
+      \left[`r latex_X_amp[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:X13}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[1,3]}=&
+      \left[`r latex_X_amp[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:X14}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[1,4]}=&
+      \left[`r latex_X_amp[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+\begin{equation}
+  \label{eq:X21}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[2,1]}=&
+      \left[`r latex_X_amp[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:X22}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[2,2]}=&
+      \left[`r latex_X_amp[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:X23}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[2,3]}=&
+      \left[`r latex_X_amp[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:X24}
+    \begin{split}
+      \mathbf{X}'^{(0)\intercal}_{[2,4]}=&
+      \left[`r latex_X_amp[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+#### Iteración
+
+Para cada iteración $l = 1,2,\dots$:
+
+1.  **Estimación del MFA**\
+    Se aplica un MFA a $\mathbf{X}'^{(l-1)}$, conservando $S$ dimensiones,
+    lo que produce:
+    -   coordenadas $\widehat{\mathbf{T}}^{(l-1)}$,
+    -   cargas $\widehat{\mathbf{W}}^{(l-1)}$,
+    -   eigenvalores $\widehat{\boldsymbol{\lambda}}^{(l-1)}$.
+    
+En *Poison*, para la primera iteración, y tomando $S = 5$, obtenemos:
+
+\begin{equation}
+\boldsymbol{\lambda}^{(0)} \approx \left[`r knitr::combine_words(as.character(format(round(GlobalLambda, 3), scientific = FALSE, nsmall = 3)), and = ",", oxford_comma = F)`\right]
+\end{equation}
+
+```{r, eval=T}
+# Manually format the matrix
+latex_matrix <- "\\widehat{\\mathbf{W}}^{(0)\\intercal}= \\left[ \\begin{array}{"
+# Column alignment
+latex_matrix <- paste0(latex_matrix, paste0(rep("c",nrow(UU)),collapse = ''), "}")
+# Add the data rows
+for (i in 1:ncol(UU)) {
+    row <- paste(t(format(round(UU,3), scientific = FALSE, nsmall = 3))[i,], collapse = " & ")
+    latex_matrix <- paste0(latex_matrix, row, " \\\\ ")
+}
+# Add closing tags
+latex_matrix <- paste0(latex_matrix, "\\end{array} \\right]")
+```
+
+
+\begin{equation}
+  \label{eq:UUpoison}
+  `r latex_matrix`
+\end{equation}
+
+```{r, eval=T}
+# Manually format the matrix
+latex_matrix <- "\\widehat{\\mathbf{T}}^{(0)\\intercal}= \\left[ \\begin{array}{"
+# Column alignment
+latex_matrix <- paste0(latex_matrix, paste0(rep("c",nrow(FF)),collapse = ''), "}")
+# Add the data rows
+for (i in 1:ncol(FF)) {
+    row <- paste(t(format(round(FF,3), scientific = FALSE, nsmall = 3))[i,], collapse = " & ")
+    latex_matrix <- paste0(latex_matrix, row, " \\\\ ")
+}
+# Add closing tags
+latex_matrix <- paste0(latex_matrix, "\\end{array} \\right]")
+```
+
+
+\begin{equation}
+  \label{eq:FFpoison}
+  `r latex_matrix`
+\end{equation}
+
+2.  **Regularización de los eigenvalores**
+
+En cada iteración, el MFA aplicado a la tabla imputada produce un
+conjunto de eigenvalores que cuantifican la importancia relativa de cada dimensión factorial. 
+Sin embargo, cuando los datos contienen valores faltantes, estas estimaciones tienden a ser inestables, especialmente en las dimensiones de orden superior. 
+En particular, los eigenvalores pequeños suelen capturar más ruido que estructura, pero aun así influyen en la reconstrucción de los datos faltantes.
+
+La regularización introduce un mecanismo explícito para controlar la
+contribución de estas dimensiones residuales. 
+Conceptualmente, este paso cumple dos funciones complementarias:
+
+-   Evitar el sobreajuste: sin regularización, la reconstrucción puede adaptarse excesivamente a patrones espurios inducidos por     imputaciones previas.
+
+-   Estabilizar la reconstrucción: al reducir la influencia de     dimensiones poco informativas, se privilegia la estructura común capturada por los primeros ejes.
+
+La regularización se hace a través del parámetro $\mu^{(l)}$: la media ajustada por dimensionalidad de los eigenvectores residuales.
+\begin{equation}
+   \mu^{(l)} =
+   \min\left(
+   \frac{I \cdot d}{\min(d,I-1)}
+   \frac{\sum_{r=S+1}^{\min(I,d)} (\lambda_r^{(l-1)})^2}{D_f},
+   (\lambda_{S+1}^{(l-1)})^2
+   \right),
+ \end{equation} 
+donde $d$ es la dimensión efectiva de la tabla disyuntiva completa: $d=K-\Sigma_{n\in\text{Categórico}}J_n$ y $D_f$ los grados de libertad asociados: $D_f=(I-S-1)(d-S)$.
+
+El parámetro $\mu^{(l)}$ actúa como un umbral que cuantifica la cantidad de variación residual que se considera atribuible al ruido.
+Su definición combina información sobre:
+
+-   la magnitud de los eigenvalores descartados,
+
+-   la dimensionalidad efectiva del problema,
+
+-    y los grados de libertad disponibles.
+
+Los eigenvalores regularizados se definen como: 
+\begin{equation}
+  \lambda_{i\ \text{reg}}^{(l)}=\lambda_i^{(l-1)}-\frac{\mu^{(l)}}{\lambda_i^{(l-1)}}
+\end{equation}
+
+Entonces, para *Poison* tenemos:
+$$d=K-\Sigma_{n\in\text{Categórico}}J_n=`r K`-`r sum(Jn[2:4])`=`r da`,$$
+y los grados de libertad asociados:
+$$
+D_f=(I-S-1)(d-S)=(`r I`-5-1)(`r da`-5)=`r Df`.
+$$
+$$
+\begin{aligned}
+   \mu^{(1)} &=
+   \min\left(
+   \frac{`r I` \cdot `r da`}{\min(`r da`,`r I`-1)}
+   \frac{\sum_{r=5+1}^{\min(`r I`,`r da`)} (\lambda_r^{(0)})^2}{`r Df`},
+   (\lambda_{5+1}^{(0)})^2
+   \right)\\
+   &=
+   \min\left(
+   \frac{`r I` \cdot `r da`}{`r min(da, I - 1)`}
+   \frac{`r round(sum(OtherLambda^2),4)`}{`r Df`},
+   `r round(GlobSVDpoison[["vs"]][6],4)`^2
+   \right)\\
+   &\approx `r format(round(sigma2, 3), scientific = FALSE, nsmall = 3)`
+\end{aligned}
+$$
+El resultado es:
+
+\begin{equation}
+\lambda_{\text{reg}}^{(1)} \approx \left[`r knitr::combine_words(as.character(format(round(RegLambda, 3), scientific = FALSE, nsmall = 3)), and = ",", oxford_comma = F)`\right]
+\end{equation}
+
+La alta similitud entre $\lambda^{(0)}$ y
+$\lambda_{\text{reg}}^{(1)}$ indica que la relación
+señal-ruido es alta, lo cual es deseable.
+
+3.  **Reconstrucción de la tabla completa**\
+    Se obtiene una estimación de la tabla completa mediante:
+    $$
+    {x'}_{ik}^{(l)}=\frac{1}{r_i}\left(\sum_{s=1}^S r_i\cdot w_{is}^{(l-1)}\cdot \lambda_{s\ \text{reg}}^{(l)}\cdot t_{ks}^{(0)}\right)
+    $$
+    donde: $w_{is}^{(l-1)}$ es el elemento genérico de $\widehat{\mathbf{W}}^{(l-1)}$ y $t_{ks}^{(0)}$ es el elemento genérico de $\widehat{\mathbf{T}}^{(l-1)}.$
+
+
+Antes de poderlo hacer en *Poison*, vamos a definir los pesos $\mathbf{r}$: Recordemos que el mecanismo de pérdida definía una probabilidad de pérdida mayor si los datos eran típicos de un adulto. Por lo tanto, la información de los adultos es más importante que la de los niños a la hora de estimar el valor faltante. Para este ejercicio, pongamos un peso arbitrario dos veces mayor a los datos de los adultos. O sea,
+$$
+\boldsymbol{r}\approx \left[`r knitr::combine_words(as.character(format(round(w, 3), scientific = FALSE, nsmall = 3)), and = ",", oxford_comma = F)`\right]
+$$
+
+Nótese que la suma de estos valores debe dar uno. Tómese en cuenta que una forma más responsable de definir los pesos sería hacer un análisis de sensibilidad y elegir a partir de éste. Pero, para fines prácticos e ilustrativos basta este criterio arbitrario.
+
+Como se puede ver a continuación, los resultados estimados para $\mathbf{\widehat{X}}'^{(1)}$ muestran ligeras diferencias con respecto a $\mathbf{X}'^{(0)}$.
+
+```{r latex_X1hat, eval=T}
+X1hat_list <- list(
+  stratum1 = list(X1_11, X1_12, X1_13, X1_14),
+  stratum2 = list(X1_21, X1_22, X1_23, X1_24)
+)
+latex_X1hat <- lapply(X1hat_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'hat(1, RIMFA)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xone11}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,1]}=&
+      \left[`r latex_X1hat[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone12}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,2]}=&
+      \left[`r latex_X1hat[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone13}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,3]}=&
+      \left[`r latex_X1hat[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone14}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,4]}=&
+      \left[`r latex_X1hat[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone21}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,1]}=&
+      \left[`r latex_X1hat[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone22}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,2]}=&
+      \left[`r latex_X1hat[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone23}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,3]}=&
+      \left[`r latex_X1hat[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xone24}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,4]}=&
+      \left[`r latex_X1hat[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+
+4.  **Actualización de los valores faltantes**\
+    Los valores observados se mantienen fijos y los faltantes se
+    reemplazan por la reconstrucción, lo que algebraicamente es: \begin{equation}
+    \mathbf{X}'^{(l)} =
+    \mathbf{R}\circ \mathbf{X}'
+    +
+    (1-\mathbf{R})\circ \widehat{\mathbf{X}}'^{(l)},
+    \end{equation}
+    donde recordemos que $\circ$ es la multiplicación elemento por elemento.
+
+Esto garantiza que el resultado final no se desvíe de los datos observados. En nuestro caso, esta reconstrucción es $\mathbf{X}'^{(1)}$:
+
+
+```{r latex_X1imp, eval=T}
+X1imp_list <- list(
+  stratum1 = list(X1_11imp, X1_12imp, X1_13imp, X1_14imp),
+  stratum2 = list(X1_21imp, X1_22imp, X1_23imp, X1_24imp)
+)
+latex_X1imp <- lapply(X1imp_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'(1, imputada)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:XoneImp11}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[1,1]}=&
+      \left[`r latex_X1imp[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp12}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[1,2]}=&
+      \left[`r latex_X1imp[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp13}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[1,3]}=&
+      \left[`r latex_X1imp[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp14}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[1,4]}=&
+      \left[`r latex_X1imp[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp21}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[2,1]}=&
+      \left[`r latex_X1imp[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp22}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[2,2]}=&
+      \left[`r latex_X1imp[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp23}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[2,3]}=&
+      \left[`r latex_X1imp[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XoneImp24}
+    \begin{split}
+      \mathbf{X}'^{(1)\intercal}_{[2,4]}=&
+      \left[`r latex_X1imp[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+### Convergencia del algoritmo RIMFA
+
+El algoritmo RIMFA se basa en un esquema iterativo de estimación alternante, en el que se actualizan sucesivamente el subespacio factorial y los valores faltantes.
+
+Sin embargo, a diferencia de métodos definidos a partir de un modelo probabilístico explícito, no existe, que yo conozca, una garantía teórica general de convergencia global para RIMFA. En particular, el criterio implícito que el algoritmo intenta optimizar puede no ser convexo, y la presencia de regularización introduce una dependencia adicional de los eigenvalores estimados en cada iteración.
+
+A pesar de ello, existen razones prácticas para esperar convergencia en muchos contextos de aplicación. Cada iteración combina una estimación factorial regularizada con una reconstrucción coherente de los valores faltantes, lo que tiende a estabilizar progresivamente la tabla imputada. La regularización de los eigenvalores desempeña un papel clave al limitar la influencia de dimensiones residuales y amortiguar posibles oscilaciones.
+
+En la práctica, la convergencia se deberá evaluar empíricamente mediante criterios numéricos, tales como la estabilización del error de reconstrucción o de las imputaciones entre iteraciones sucesivas. En todos los experimentos presentados en este trabajo, el algoritmo alcanzó un estado estable tras un número finito de iteraciones.
+
+### Alcance del RIMFA
+
+RIMFA produce una única base imputada que es coherente con la estructura
+factorial del MFA bajo el número de dimensiones $S$ elegido. Si bien
+este método no cuantifica la incertidumbre asociada a la imputación,
+constituirá un bloque fundamental para construir un esquema de imputación
+múltiple que preserve la geometría inducida por el MFA: MIRIMFA.
+
+En las secciones siguientes se analizarán los mecanismos de pérdida bajo
+los cuales RIMFA es aplicable y se presentará su extensión a imputación
+múltiple mediante ACT-STATIS, dando lugar al método MIRIMFA.
+
+### Convergencia y Resultados Finales
+
+Tras `r iteration` iteraciones, obtenemos la matriz imputada
+$\mathbf{X}'^{(f)}$. Para las variables binarias, asignamos a
+cada observación la categoría con el valor mayor. El resultado final
+puede visualizarse a continuación:
+
+```{r latex_Xfin, eval=T}
+Xfin_list <- list(
+  stratum1 = list(Xf_11, Xf_12, Xf_13, Xf_14),
+  stratum2 = list(Xf_21, Xf_22, Xf_23, Xf_24)
+)
+latex_Xfin <- lapply(Xfin_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'(f, imputación final)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xfin11}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,1]}=&
+      \left[`r latex_Xfin[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin12}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,2]}=&
+      \left[`r latex_Xfin[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin13}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,3]}=&
+      \left[`r latex_Xfin[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin14}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,4]}=&
+      \left[`r latex_Xfin[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin21}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,1]}=&
+      \left[`r latex_Xfin[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin22}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,2]}=&
+      \left[`r latex_Xfin[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin23}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,3]}=&
+      \left[`r latex_Xfin[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xfin24}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,4]}=&
+      \left[`r latex_Xfin[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+### Redondeo
+
+Notemos que este método obtuvo una matriz imputada con valores continuos, incluso para las variables categóricas, por lo que los valores se redondean a 0 o 1.
+
+
+```{r latex_XfinRound, eval=T}
+XfinRound_list <- list(
+  stratum1 = list(Xf_11, Xf_12, Xf_13, Xf_14),
+  stratum2 = list(Xf_21, Xf_22, Xf_23, Xf_24)
+)
+latex_XfinRound <- lapply(XfinRound_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 0))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'(f, redondeada)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:XfinRound11}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,1]}=&
+      \left[`r latex_XfinRound[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound12}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,2]}=&
+      \left[`r latex_XfinRound[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound13}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,3]}=&
+      \left[`r latex_XfinRound[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound14}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[1,4]}=&
+      \left[`r latex_XfinRound[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound21}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,1]}=&
+      \left[`r latex_XfinRound[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound22}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,2]}=&
+      \left[`r latex_XfinRound[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound23}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,3]}=&
+      \left[`r latex_XfinRound[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:XfinRound24}
+    \begin{split}
+      \mathbf{X}'^{(f)\intercal}_{[2,4]}=&
+      \left[`r latex_XfinRound[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+Finalmente, se devuelve la tabla disyuntiva completa $\mathbf{X}'^{(f)}$ a su matriz de observaciones $\mathbf{X}^{(f)}$.
+
+### Evaluación de la Imputación
+
+Evaluamos la imputación en dos aspectos:
+
+1.  **Semejanza a la matriz original** $\mathbf{Y}$: Para calcular la semejanza entre matrices, usamos el coeficiente $R_V$ ajustado. Éste es la extensión natural del coeficiente de determinación ($R^2$) para comparar dos bloques de variables (matrices $\mathbf{X}$ y $\mathbf{Y}$) en lugar de dos variables individuales.Intuitivamente, mientras que el $R^2$ de Pearson mide la colinealidad entre dos vectores, el $R_V$ mide la similitud entre la estructura de covarianzas de dos conjuntos de variables.
+
+$$RV_{\text{adj}}(\mathbf{X}, \mathbf{Y}) = \frac{\text{tr}(\mathbf{S}_{XY} \mathbf{S}_{YX})}{\sqrt{\text{tr}(\mathbf{S}_{XX}^2) \cdot \text{tr}(\mathbf{S}_{YY}^2)}}$$
+
+donde:
+
+- $\mathbf{S}_{XY}$ es la matriz de correlaciones ajustadas $r^2_{\text{adj}}$ entre todas las variables de $\mathbf{X}$ y las de $\mathbf{Y}$ y
+-   \begin{equation}
+     r^2_{\text{adj}}(x, y) = 1 - \frac{n-1}{n-2}(1 - r^2(x, y))
+    \end{equation} 
+    
+    En este caso, aplicado a $\mathbf{X}'^{(f)}$ y
+    $\mathbf{Y}'$,
+    $RV_{\text{adj}}(\mathbf{X}, \mathbf{Y}) = `r format(RV, scientific = TRUE)`$,
+    indicando una correspondencia casi perfecta.
+
+2.  **Conservación de la distribución condicional:** Comparando
+    visualmente los MFAs de $\mathbf{Y}$ y $\mathbf{X}'^{(f)}$
+    en la figura siguiente, observamos que las variables
+    clave mantienen su importancia relativa.
+
+
+```{r comparVarMFApoison, eval=TRUE, fig.cap='Comparación de la distribución de las variables en el espacio de las dos primeras dimensiones del MFA aplicado a la base de datos original &quot;Poison&quot; y a la amputada e imputada al 10\\%.' }
+
+var_plot1 <- fviz_pca_var(MFA_poison[["global.pca"]],
+                          repel = TRUE)
+var_plot2 <- fviz_pca_var(MFA_final_result[["global.pca"]],
+                          repel = TRUE)
+var_comparison <- grid.arrange(var_plot1, var_plot2, ncol = 2)
+```
+
+### Conclusión
+
+El RIMFA logró reconstruir los datos reales con un ajuste notable, dado
+un `r format(round(percent_miss*100, 3), scientific = FALSE, nsmall = 3)`% de datos faltantes. Posteriormente
+analizaremos el desempeño ante mayores proporciones de valores
+faltantes, pero antes hemos de explorar el impacto de imputaciones
+múltiples, lo cual abordaremos en la siguiente sección.
+
+
+# Imputación Múltiple
+
+La imputación simple mediante RIMFA produjo una única base completa, lo que permitió aplicar MFA aun en presencia de valores faltantes.
+Sin embargo, esta aproximación no proporciona información sobre la incertidumbre asociada a la imputación, un aspecto central desde una perspectiva inferencial y epistemológica.
+
+La imputación múltiple aborda esta limitación generando varias versiones plausibles de la base completa y evaluando la variabilidad entre los análisis resultantes. 
+En este contexto, la dificultad no radica únicamente en generar múltiples imputaciones, sino en integrar los resultados de métodos de reducción de dimensiones, que no producen estimadores escalares directamente combinables.
+
+### Imputación múltiple: principio general
+
+La imputación múltiple consta de tres etapas conceptuales:
+
+1. **Imputación**: se generan $Q$ bases completas $\mathbf{X}_1,\dots,\mathbf{X}_Q$, idénticas en los valores observados y distintas en los valores imputados.
+2. **Análisis**: se aplica el método de interés de forma independiente a cada base imputada.
+3. **Agregado**: se combinan los resultados para obtener una descripción que incorpore la variabilidad inducida por la imputación.
+
+Este flujo de trabajo se puede visualizar en la siguiente figura:
+
+```{r vanBuurenMI, echo=FALSE, fig.cap="Flujo de trabajo típico de la imputación múltiple. Adaptado de van Buuren (2018)", out.width = '100%', eval=TRUE}
+knitr::include_graphics(here( "ExternalFigures", "MultipleImputationFlowDiagramVanBuuren.png"))
+```
+
+
+En modelos de regresión, la etapa de agregado se realiza mediante las reglas de Rubin [@rubin_multiple_2004], que combinan estimadores puntuales y varianzas. 
+Sin embargo, en métodos factoriales como el PCA, el MCA o el MFA, los resultados son geométricos (coordenadas, ejes, subespacios), lo que requiere un enfoque distinto.
+
+Comenzando con la imputación, para hacer que **RIMFA** sea un método de imputación múltiple basta con correr el algoritmo con distintas inicializaciones aleatorias. Por ejemplo:
+
+-   En el caso anterior, se inicializaron:
+    -   **Variables numéricas** con ceros.
+    -   **Variables categóricas** con las proporciones observadas.
+-   Para la imputación múltiple, podemos:
+    -   Inicializar las **variables numéricas** con valores aleatorios.
+    -   Inicializar las **variables categóricas** con valores aleatorios que mantengan la condición de que la suma para cada individuo y variable sea igual a uno.
+
+Al proceder de esta manera, obtenemos una muestra más amplia del espacio de posibles imputaciones. 
+En este ejemplo, utilizamos $Q = 3$ imputaciones, y en cada resultado final se obtuvieron los resultados siguientes:
+
+### Datos reagrupados de las tres imputaciones
+
+
+```{r, eval=TRUE}
+Z1 <- scale(as.matrix(MFA_final_result[["ind"]][["coord"]]))
+Imput2 <- imputeMFAseedSolved(data_amputed,
+                         ncp = 5, 
+                         type = c("s","n","n","n"), 
+                         group = Jn,
+                         seed = 1234,
+                         row.w = w)
+Xq2 <- Imput2$completeObs
+MFA_2 <- MFA(Xq2, 
+                  group = c(2, 2, 5, 6), # Adjust groups based on the structure of poison
+                  type = c("s", "n", "n", "n"), # Type of variables: s for numeric, n for categorical
+                  name.group = c("Group1", "Group2", "Group3", "Group4"),
+                  graph = FALSE)
+Z2 <- scale(as.matrix(MFA_2[["ind"]][["coord"]]))
+
+Imput3 <- imputeMFAseedSolved(data_amputed,
+                         ncp = 5, 
+                         type = c("s","n","n","n"), 
+                         group = Jn,
+                         seed = 6456,
+                         row.w = w)
+Xq3 <- Imput3$completeObs
+MFA_3 <- MFA(Xq3, 
+                  group = c(2, 2, 5, 6), # Adjust groups based on the structure of poison
+                  type = c("s", "n", "n", "n"), # Type of variables: s for numeric, n for categorical
+                  name.group = c("Group1", "Group2", "Group3", "Group4"),
+                  graph = FALSE)
+Z3 <- scale(as.matrix(MFA_3[["ind"]][["coord"]]))
+
+Znorm1 <- Z1*sqrt(1/5)
+Znorm2 <- Z2*sqrt(1/5)
+Znorm3 <- Z3*sqrt(1/5)
+S1 <- Znorm1%*%t(Znorm1)
+S2 <- Znorm2%*%t(Znorm2)
+S3 <- Znorm3%*%t(Znorm3)
+S_list <- list(S1,S2,S3)
+Q <- length(S_list)
+C <- matrix(0, nrow = Q, ncol = Q)
+
+for (q in 1:Q) {
+  for (q_prime in 1:Q) {
+    # Compute the numerator: tr(S_q' S_q')
+    numerator <- tr(t(S_list[[q]]) %*% S_list[[q_prime]])
+    
+    # Compute the denominator: sqrt(tr(S_q' S_q) * tr(S_q' S_q'))
+    denominator <- sqrt(tr(t(S_list[[q]]) %*% S_list[[q]]) * tr(t(S_list[[q_prime]]) %*% S_list[[q_prime]]))
+    
+    # Assign the value to C[q, q']
+    C[q, q_prime] <- numerator / denominator
+  }
+}
+
+pcaC <- eigen(C)
+Ppca <- pcaC$vectors
+Theta <- pcaC$values
+G <- Ppca%*%diag(sqrt(Theta))
+
+C_reconstructed <- Ppca %*% diag(Theta) %*% t(Ppca)
+
+alpha <- abs(Ppca[,1])
+alpha <- alpha/sum(alpha)
+
+
+S1norm <- S1/sqrt(tr(t(S1)%*%S1))
+S2norm <- S2/sqrt(tr(t(S2)%*%S2))
+S3norm <- S3/sqrt(tr(t(S3)%*%S3))
+S_list_norm <- list(S1norm,S2norm,S3norm)
+
+
+# Weighted sum of matrices
+Splus <- matrix(0, nrow=nrow(S1), ncol=ncol(S1))  # Initialize a zero matrix with same dimensions
+
+for (i in 1:length(alpha)) {
+  Splus <- Splus + alpha[i] * S_list_norm[[i]]
+}
+
+eigenSplus <- eigen(Splus)
+Qmat <- eigenSplus$vectors
+Xmat <- diag(eigenSplus$values)
+Zc <- Qmat%*%sqrt(Xmat)[,1:5]
+```
+
+```{r, eval=T}
+Xq2 <- dummy_cols(Xq2,remove_selected_columns = T,remove_first_dummy = T)
+colnames(Xq2) <- colnames(poison)
+Xq2[, 3:ncol(Xq2)] <- lapply(Xq2[, 3:ncol(Xq2)], as.factor)
+levels(Xq2[,4]) <- c("F","M")
+
+Xq2_11 <- Xq2[Xq2$Age<13,1:Jn[1]]
+Xq2_12 <- Xq2[Xq2$Age<13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Xq2_13 <- Xq2[Xq2$Age<13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Xq2_14 <- Xq2[Xq2$Age<13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+Xq2_21 <- Xq2[Xq2$Age>=13,1:Jn[1]]
+Xq2_22 <- Xq2[Xq2$Age>=13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Xq2_23 <- Xq2[Xq2$Age>=13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Xq2_24 <- Xq2[Xq2$Age>=13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+```
+
+```{r, eval=T}
+Xq3 <- dummy_cols(Xq3,remove_selected_columns = T,remove_first_dummy = T)
+colnames(Xq3) <- colnames(poison)
+Xq3[, 3:ncol(Xq3)] <- lapply(Xq3[, 3:ncol(Xq3)], as.factor)
+levels(Xq3[,4]) <- c("F","M")
+
+Xq3_11 <- Xq3[Xq3$Age<13,1:Jn[1]]
+Xq3_12 <- Xq3[Xq3$Age<13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Xq3_13 <- Xq3[Xq3$Age<13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Xq3_14 <- Xq3[Xq3$Age<13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+Xq3_21 <- Xq3[Xq3$Age>=13,1:Jn[1]]
+Xq3_22 <- Xq3[Xq3$Age>=13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Xq3_23 <- Xq3[Xq3$Age>=13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Xq3_24 <- Xq3[Xq3$Age>=13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+```
+
+```{r,eval=TRUE}
+  imputeMissingMFA <- function(incompData, U, comp, maxiter, 
+    threshold) {
+    id.na <- is.na(incompData)
+    real.na <- matrix(FALSE, nrow = nrow(incompData), ncol = ncol(incompData))
+    for (i in 1:ncol(incompData)) {
+      if (grepl("\\.\\d+", colnames(incompData)[i])) {
+        real.na[, i] <- incompData[, i] != 0 & incompData[, 
+          i] != 1
+      }
+      else {
+        real.na[, i] <- is.na(incompData[, i])
+      }
+    }
+    colnames(real.na) <- colnames(incompData)
+    rownames(real.na) <- rownames(incompData)
+    Xold <- incompData
+    Xold[id.na] <- 0
+    U <- as.matrix(U[, comp])
+    Vold <- matrix(999, nrow = ncol(incompData), ncol = length(comp))
+    iter <- 0
+    repeat {
+      Xold <- scale(Xold)
+      center <- attr(Xold, "scaled:center")
+      sigma <- attr(Xold, "scaled:scale")
+      V <- t(solve(crossprod(U)) %*% t(U) %*% Xold)
+      Xnew <- U %*% t(V)
+      Xnew <- sweep(Xnew, 2, sigma, "*")
+      Xnew <- sweep(Xnew, 2, center, "+")
+      Xnew[!real.na] <- incompData[!real.na]
+      if (sqrt(sum((V - Vold)^2)) < threshold) 
+        break
+      Xold <- Xnew
+      if (iter == maxiter) {
+        warning(paste("maximum number of iterations reached in data imputation with", 
+          sqrt(sum((V - Vold)^2)), "/", threshold, "=", 
+          format(round(sqrt(sum((V - Vold)^2))/threshold, 2), scientific = FALSE, nsmall = 4)), 
+          call. = FALSE)
+        break
+      }
+      Vold <- V
+      iter <- iter + 1
+    }
+    imputed <- Xnew[real.na]
+    original <- incompData[!real.na]
+    return(list(imputed = imputed, original = original, 
+      total = Xnew))
+  }
+
+  find.category <- function(X, tabdisj) {
+    nbdummy <- rep(1, ncol(X))
+    is.quali <- which(!unlist(lapply(X, is.numeric)))
+    nbdummy[is.quali] <- unlist(lapply(X[, is.quali, drop = FALSE], 
+      nlevels))
+    vec = c(0, cumsum(nbdummy))
+    Xres <- X
+    for (i in 1:ncol(X)) {
+      if (i %in% is.quali) 
+        Xres[, i] <- as.factor(levels(X[, i])[apply(tabdisj[, 
+          (vec[i] + 1):vec[i + 1]], 1, which.max)])
+      else Xres[, i] <- tabdisj[, vec[i] + 1]
+    }
+    return(Xres)
+  }
+```
+
+```{r,eval=TRUE}
+Xprimeplus <- imputeMissingMFA(CDT, Zc, comp = seq_len(5), maxiter = 1000, threshold = 1e-06)
+
+Xplus <- find.category(data_amputed,Xprimeplus$total)
+```
+
+```{r, eval=T}
+Xplus <- dummy_cols(Xplus,remove_selected_columns = T,remove_first_dummy = T)
+colnames(Xplus) <- colnames(poison)
+Xplus[, 3:ncol(Xplus)] <- lapply(Xplus[, 3:ncol(Xplus)], as.factor)
+levels(Xplus[,4]) <- c("F","M")
+
+Xplus_11 <- Xplus[Xplus$Age<13,1:Jn[1]]
+Xplus_12 <- Xplus[Xplus$Age<13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Xplus_13 <- Xplus[Xplus$Age<13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Xplus_14 <- Xplus[Xplus$Age<13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+Xplus_21 <- Xplus[Xplus$Age>=13,1:Jn[1]]
+Xplus_22 <- Xplus[Xplus$Age>=13,(cumsum(Jn)[1]+1):cumsum(Jn)[2]]
+Xplus_23 <- Xplus[Xplus$Age>=13,(cumsum(Jn)[2]+1):cumsum(Jn)[3]]
+Xplus_24 <- Xplus[Xplus$Age>=13,(cumsum(Jn)[3]+1):cumsum(Jn)[4]]
+```
+
+```{r latex_FR, eval=T}
+FR_list <- list(
+  stratum1 = list(FR11, FR12, FR13, FR14),
+  stratum2 = list(FR21, FR22, FR23, FR24)
+)
+latex_FR <- lapply(FR_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X1(imputación 1)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:FR11}
+    \begin{split}
+      \mathbf{X}_{1[1,1]}^{\intercal} =&
+      \left[`r latex_FR[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:FR12}
+    \begin{split}
+      \mathbf{X}_{1[1,2]}^{\intercal} =&
+      \left[`r latex_FR[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:FR13}
+    \begin{split}
+      \mathbf{X}_{1[1,3]}^{\intercal} =&
+      \left[`r latex_FR[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:FR14}
+    \begin{split}
+      \mathbf{X}_{1[1,4]}^{\intercal} =&
+      \left[`r latex_FR[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+\begin{equation}
+  \label{eq:FR21}
+    \begin{split}
+      \mathbf{X}_{1[2,1]}^{\intercal} =&
+      \left[`r latex_FR[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:FR22}
+    \begin{split}
+      \mathbf{X}_{1[2,2]}^{\intercal} =&
+      \left[`r latex_FR[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:FR23}
+    \begin{split}
+      \mathbf{X}_{1[2,3]}^{\intercal} =&
+      \left[`r latex_FR[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:FR24}
+    \begin{split}
+      \mathbf{X}_{1[2,4]}^{\intercal} =&
+      \left[`r latex_FR[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+
+
+```{r latex_Xq2, eval=T}
+Xq2_list <- list(
+  stratum1 = list(Xq2_11, Xq2_12, Xq2_13, Xq2_14),
+  stratum2 = list(Xq2_21, Xq2_22, Xq2_23, Xq2_24)
+)
+latex_Xq2 <- lapply(Xq2_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X2(imputación 2)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xq2_11}
+    \begin{split}
+      \mathbf{X}_{2[1,1]}^{\intercal} =&
+      \left[`r latex_Xq2[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_12}
+    \begin{split}
+      \mathbf{X}_{2[1,2]}^{\intercal} =&
+      \left[`r latex_Xq2[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_13}
+    \begin{split}
+      \mathbf{X}_{2[1,3]}^{\intercal} =&
+      \left[`r latex_Xq2[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_14}
+    \begin{split}
+      \mathbf{X}_{2[1,4]}^{\intercal} =&
+      \left[`r latex_Xq2[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_21}
+    \begin{split}
+      \mathbf{X}_{2[2,1]}^{\intercal} =&
+      \left[`r latex_Xq2[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_22}
+    \begin{split}
+      \mathbf{X}_{2[2,2]}^{\intercal} =&
+      \left[`r latex_Xq2[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_23}
+    \begin{split}
+      \mathbf{X}_{2[2,3]}^{\intercal} =&
+      \left[`r latex_Xq2[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq2_24}
+    \begin{split}
+      \mathbf{X}_{2[2,4]}^{\intercal} =&
+      \left[`r latex_Xq2[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+
+
+```{r latex_Xq3, eval=T}
+Xq3_list <- list(
+  stratum1 = list(Xq3_11, Xq3_12, Xq3_13, Xq3_14),
+  stratum2 = list(Xq3_21, Xq3_22, Xq3_23, Xq3_24)
+)
+latex_Xq3 <- lapply(Xq3_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X3(imputación 3)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xq3_11}
+    \begin{split}
+      \mathbf{X}_{3[1,1]}^{\intercal} =&
+      \left[`r latex_Xq3[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_12}
+    \begin{split}
+      \mathbf{X}_{3[1,2]}^{\intercal} =&
+      \left[`r latex_Xq3[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_13}
+    \begin{split}
+      \mathbf{X}_{3[1,3]}^{\intercal} =&
+      \left[`r latex_Xq3[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_14}
+    \begin{split}
+      \mathbf{X}_{3[1,4]}^{\intercal} =&
+      \left[`r latex_Xq3[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_21}
+    \begin{split}
+      \mathbf{X}_{3[2,1]}^{\intercal} =&
+      \left[`r latex_Xq3[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_22}
+    \begin{split}
+      \mathbf{X}_{3[2,2]}^{\intercal} =&
+      \left[`r latex_Xq3[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_23}
+    \begin{split}
+      \mathbf{X}_{3[2,3]}^{\intercal} =&
+      \left[`r latex_Xq3[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xq3_24}
+    \begin{split}
+      \mathbf{X}_{3[2,4]}^{\intercal} =&
+      \left[`r latex_Xq3[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+
+
+# Agregado mediante ACT-STATIS
+
+Las tres imputaciones generadas mediante RIMFA producen tres bases de datos completas y, al aplicar MFA a cada una, tres espacios factoriales potencialmente rotados entre sí. Combinarlas mediante reglas algebraicas estándar (como la media de los factores) sería incorrecto: el MFA no produce estimadores escalares combinables. Para agregar resultados factoriales múltiples respetando la indeterminación de rotación propia de estos métodos, utilizamos ACT-STATIS (Análisis Conjunto de Cuadro — Structuration des Tableaux à Trois Indices de la Statistique).
+
+
+```{r,eval=TRUE}
+RVplus <- RVadjMaye(as.matrix(Xprimeplus$total), as.matrix(MDC))
+```
+
+```{r,eval=TRUE}
+# Perform MFA on the imputed dataset
+MFA_MIRIMFA <- MFA(Xplus,
+                   group = c(2, 2, 5, 6), # Same group structure as poison
+                   type = c("s", "n", "n", "n"),
+                   name.group = c("Group1", "Group2", "Group3", "Group4"),
+                   graph = FALSE)
+
+```
+
+```{r, eval=TRUE}
+RIMFA_number_1 <- list(imputation = list(tab.disj = as.matrix(completeObs),
+                                     completeObs = final_result,
+                                     call = list(group.mod = Kn,
+                                                 ind.var = list(c(1,2),3:6))), 
+                       MFA = MFA_final_result[["ind"]][["coord"]], 
+                       call = list(X = data_amputed, 
+                                   group = Jn, 
+                                   ncp = 5, 
+                                   type = c("s","n","n","n"), 
+                                   method = "Regularized", 
+                                   row.w = w, 
+                                   coeff.ridge = 1, 
+                                   threshold = 1e-06, 
+                                   ind.sup = NULL, 
+                                   num.group.sup = NULL,
+                                   seed = 1234, 
+                                   maxiter = 1000, 
+                                   name.group = NULL))
+
+RIMFA_number_2 <- list(imputation = Imput2, 
+                       MFA = MFA_2[["ind"]][["coord"]], 
+                       call = list(X = data_amputed, 
+                                   group = Jn, 
+                                   ncp = 5, 
+                                   type = c("s","n","n","n"), 
+                                   method = "Regularized", 
+                                   row.w = w, 
+                                   coeff.ridge = 1, 
+                                   threshold = 1e-06, 
+                                   ind.sup = NULL, 
+                                   num.group.sup = NULL,
+                                   seed = 1234, 
+                                   maxiter = 1000, 
+                                   name.group = NULL))
+
+RIMFA_number_3 <- list(imputation = Imput3, 
+                       MFA = MFA_3[["ind"]][["coord"]], 
+                       call = list(X = data_amputed, 
+                                   group = Jn, 
+                                   ncp = 5, 
+                                   type = c("s","n","n","n"), 
+                                   method = "Regularized", 
+                                   row.w = w, 
+                                   coeff.ridge = 1, 
+                                   threshold = 1e-06, 
+                                   ind.sup = NULL, 
+                                   num.group.sup = NULL,
+                                   seed = 6456, 
+                                   maxiter = 1000, 
+                                   name.group = NULL))
+saveRDS(RIMFA_number_1, file.path(here(here("imputationsRIMFA"), paste0("RIMFA_number_", 
+        1, ".rds"))))
+
+saveRDS(RIMFA_number_2, file.path(here(here("imputationsRIMFA"), paste0("RIMFA_number_", 
+        2, ".rds"))))
+
+saveRDS(RIMFA_number_3, file.path(here(here("imputationsRIMFA"), paste0("RIMFA_number_", 
+        3, ".rds"))))
+
+toyMIRIMFA <- MIRIMFA_STATIS(data_amputed,here("imputationsRIMFA"))
+```
+
+
+Tener múltiples imputaciones es de limitado uso para un análisis. 
+Se necesita poder compararlas y tener un agregado que analizar. 
+Sin embargo, cada análisis factorial produce un sistema de coordenadas definido, con sus propias rotaciones y reflexiones ortogonales. En consecuencia, las coordenadas obtenidas a partir de distintas imputaciones no son directamente comparables sin un alineamiento previo.
+
+Un enfoque típico consiste en utilizar transformaciones de Procrustes para alinear los espacios factoriales antes de compararlos [@josse_handling_2012]. Si bien este procedimiento es adecuado para PCA o MCA, resulta limitado en el contexto del MFA, donde la estructura por grupos desempeña un papel central.
+
+Para integrar múltiples resultados de MFA, Voillet et al. [-@voillet_handling_2016] proponen utilizar el método **ACT-STATIS**, diseñado para analizar simultáneamente varias tablas que describen a los mismos individuos.
+
+ACT-STATIS permite:
+
+- comparar varias representaciones factoriales,
+- identificar una estructura común (compromiso),
+- y cuantificar la variabilidad entre las soluciones individuales.
+
+### Intuición del ACT-STATIS en el contexto de imputación múltiple
+
+En el marco de la imputación múltiple, cada imputación conduce a una base completa distinta y, por lo tanto, a un resultado factorial distinto. 
+En el caso del MFA, estos resultados son representaciones geométricas de los individuos en un espacio de dimensión reducida.
+El problema central del agregado consiste en cómo sintetizar varias representaciones geométricas de los mismos individuos en una sola, sin imponer artificialmente una alineación o una estructura que no está respaldada por los datos.
+
+ACT-STATIS aborda este problema cambiando el foco del análisis. En lugar de intentar promediar directamente las coordenadas de los individuos, lo cual carece de sentido debido a la indeterminación por rotaciones y reflexiones, el método compara las estructuras internas de cada representación.
+
+Más concretamente, cada MFA aplicado a una imputación genera una nube de puntos en $\mathbb{R}^S$. 
+Aunque la orientación de estas nubes puede variar entre imputaciones, las relaciones geométricas internas (distancias relativas, ángulos, productos escalares) contienen la información relevante sobre la estructura factorial inducida por los datos.
+
+ACT-STATIS formaliza esta idea representando cada solución factorial no por sus coordenadas, sino por una matriz de producto escalar.
+Estas matrices capturan la geometría interna de cada nube y son invariantes ante rotaciones, lo que permite compararlas de manera coherente.
+
+El método procede entonces en tres ideas fundamentales:
+
+1. **Comparación entre imputaciones.**  
+   Las matrices de producto escalar asociadas a cada imputación se comparan entre sí para evaluar qué tan similares son las estructuras factoriales que producen. Esta comparación da lugar a una matriz de similitud entre imputaciones.
+
+2. **Construcción de un compromiso.**  
+   A partir de esta matriz de similitud, ACT-STATIS identifica una combinación ponderada de las imputaciones que maximiza la información compartida entre ellas. Esta combinación define el llamado *compromiso*, que puede interpretarse como la estructura factorial más representativa del conjunto de imputaciones.
+
+3. **Cuantificación de la incertidumbre.**  
+   La dispersión de las soluciones individuales alrededor del compromiso proporciona una medida directa de la sensibilidad del análisis factorial frente a la imputación. Nubes compactas indican que la estructura factorial es estable; dispersiones amplias sugieren que los resultados dependen fuertemente de los valores imputados.
+
+Desde esta perspectiva, ACT-STATIS no selecciona una imputación “mejor”, ni promedia coordenadas de manera directa. En cambio, identifica una estructura común que emerge de todas las imputaciones y la utiliza como referencia para describir tanto la señal principal como la incertidumbre asociada.
+
+En el contexto de esta tesis, esta propiedad resulta crucial. Dado que el objetivo final es realizar un MFA sobre datos con valores faltantes, ACT-STATIS permite integrar múltiples MFA coherentes en una única representación factorial, preservando la estructura por grupos y proporcionando una herramienta explícita para evaluar la robustez del análisis.
+
+Procedamos a explicar formalmente ACT-STATIS al tiempo que lo aplicamos a nuestras imputaciones de *Poison*.
+Para obtenerlo a partir de las imputaciones se utilizan las coordenadas o *scores* obtenidos de un MFA aplicado a cada matriz $\mathbf{X}_1, \dots, \mathbf{X}_q$. 
+Estas coordenadas se guardan en $\mathbf{T}_1, \dots, \mathbf{T}_q$, donde $\mathbf{T}_q$ es una matriz de tamaño $I \times S$, siendo $S$ el número de dimensiones retenidas en el MFA. 
+Estas matrices se presentan a continuación:
+
+```{r, eval=T}
+latex_Z1 <- make_latex_chunks(Z1, chunk_size = 55, digits = 3)
+latex_Z2 <- make_latex_chunks(Z2, chunk_size = 55, digits = 3)
+latex_Z3 <- make_latex_chunks(Z3, chunk_size = 55, digits = 3)
+```
+
+```{=html}
+<details>
+<summary>Mostrar matrices de scores: T<sub>1</sub>, T<sub>2</sub>, T<sub>3</sub></summary>
+<p>
+```
+
+\begin{equation}
+\label{eq:Z1}
+  \begin{split}
+    \mathbf{T}_{1}^{\intercal} =&
+    \left[`r latex_Z1[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+\begin{equation}
+\label{eq:Z2}
+  \begin{split}
+    \mathbf{T}_{2}^{\intercal} =&
+    \left[`r latex_Z2[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+\begin{equation}
+\label{eq:Z3}
+  \begin{split}
+    \mathbf{T}_{3}^{\intercal} =&
+    \left[`r latex_Z3[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+A partir de ellas, se realiza el siguiente procedimiento:
+
+###  Estandarización con normalización adicional:
+
+Se calcula:
+    \begin{equation}
+    \bar{\mathbf{T}}_q = \mathbf{T}_q S^{-\frac{1}{2}}.
+    \end{equation}
+
+Entonces tenemos las matrices:
+
+```{r, eval=T}
+latex_Z1std <- make_latex_chunks(Z1 * sqrt(1/5), chunk_size = 55, digits = 3)
+latex_Z2std <- make_latex_chunks(Z2 * sqrt(1/5), chunk_size = 55, digits = 3)
+latex_Z3std <- make_latex_chunks(Z3 * sqrt(1/5), chunk_size = 55, digits = 3)
+```
+
+```{=html}
+<details>
+<summary>Mostrar matrices estandarizadas: T&#x0305;<sub>1</sub>, T&#x0305;<sub>2</sub>, T&#x0305;<sub>3</sub></summary>
+<p>
+```
+
+\begin{equation}
+\label{eq:Zstand1}
+  \begin{split}
+    \bar{\mathbf{T}}_{1}^{\intercal} =&
+    \left[`r latex_Z1std[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+\begin{equation}
+\label{eq:Zstand2}
+  \begin{split}
+    \bar{\mathbf{T}}_{2}^{\intercal} =&
+    \left[`r latex_Z2std[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+\begin{equation}
+\label{eq:Zstand3}
+  \begin{split}
+    \bar{\mathbf{T}}_{3}^{\intercal} =&
+    \left[`r latex_Z3std[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+###  Cálculo de matrices de similitud:
+
+Se construyen las matrices de producto interno:
+    \begin{equation}
+    \mathbf{S}_q = \bar{\mathbf{T}}^\intercal_q \bar{\mathbf{T}}_q.
+    \end{equation}
+    
+Estas matrices capturan la geometría interna de cada nube y son invariantes ante rotaciones, lo que permite compararlas de manera coherente. Dado que estas matrices son de dimensión $I\times I = `r I`\times`r I`$, no se despliegan en este documento.
+
+###  Normalización por norma de Frobenius:
+
+Cada matriz de similitud $\mathbf{S}_q$ se divide por su norma de
+    Frobenius.
+    
+  \begin{equation}
+   \widetilde{\mathbf{S}}_q =
+   \frac{\mathbf{S}_q}{\sqrt{\text{tr}(\mathbf{S}_q^\intercal \mathbf{S}_q)}}.
+   \end{equation}
+
+Esto impide que las diferencias de escala distorcionen la comparación.
+
+###  Matriz de similitud entre tablas:
+   
+Se define la matriz de cosenos $\mathbf{C}\in \mathbb{R}^{Q\times Q}$ cuyo elemento $c_{q,q'}$ es:
+    
+  \begin{equation}
+   c_{q,q'} =
+   \frac{\text{tr}(\widetilde{\mathbf{S}}_q^\intercal \widetilde{\mathbf{S}}_{q'})}
+   {\sqrt{
+   \text{tr}(\widetilde{\mathbf{S}}_q^\intercal \widetilde{\mathbf{S}}_q)
+   \text{tr}(\widetilde{\mathbf{S}}_{q'}^\intercal \widetilde{\mathbf{S}}_{q'})
+   }}.
+   \end{equation}
+   Por lo que para *Poison* $\mathbf{C}$ es:
+```{r, eval=T}
+# Manually format the matrix
+latex_matrix <- paste0("\\mathbf{C}= \\left[ \\begin{array}{")
+# Column alignment
+latex_matrix <- paste0(latex_matrix, paste0(rep("c",ncol(format(round(C,3), scientific = FALSE, nsmall = 3))),collapse = ''), "}")
+# Add the data rows
+for (i in 1:nrow(format(round(C,3), scientific = FALSE, nsmall = 3))) {
+    row <- paste(format(round(C,3), scientific = FALSE, nsmall = 3)[i,], collapse = " & ")
+    latex_matrix <- paste0(latex_matrix, row, " \\\\ ")
+}
+# Add closing tags
+latex_matrix <- paste0(latex_matrix, "\\end{array} \\right]")
+```
+\begin{equation}
+  \label{eq:Cstatis}
+  `r latex_matrix`
+\end{equation}
+Esta comparación da lugar a una matriz de similitud entre imputaciones. Los valores vistos nos dicen que las imputaciones son bastante similares entre sí pues son cercanos a uno.
+
+### Descomposición de valores propios:
+
+Se recuperan las matrices $\mathbf{P}$ y $\boldsymbol{\Theta}$:
+    
+\begin{equation}
+\mathbf{C} = \mathbf{P}\boldsymbol{\Theta}\mathbf{P}^\intercal.
+\end{equation}
+
+```{r, eval=T}
+# Manually format the matrix
+latex_matrix <- paste0("\\mathbf{P}= \\left[ \\begin{array}{")
+# Polumn alignment
+latex_matrix <- paste0(latex_matrix, paste0(rep("c",ncol(format(round(Ppca,3), scientific = FALSE, nsmall = 3))),collapse = ''), "}")
+# Add the data rows
+for (i in 1:nrow(format(round(Ppca,3), scientific = FALSE, nsmall = 3))) {
+    row <- paste(format(round(Ppca,3), scientific = FALSE, nsmall = 3)[i,], collapse = " & ")
+    latex_matrix <- paste0(latex_matrix, row, " \\\\ ")
+}
+# Add closing tags
+latex_matrix <- paste0(latex_matrix, "\\end{array} \\right]")
+```
+
+\begin{equation}
+  \label{eq:Pstatis}
+  `r latex_matrix`
+\end{equation} \begin{equation}
+  \boldsymbol{\Theta}=\text{diag}{\left[`r knitr::combine_words(format(round(Theta,3), scientific = FALSE, nsmall = 3), and = ",", oxford_comma = FALSE)`\right]}
+\end{equation}
+
+### Cálculo de pesos:
+
+Los pesos $\boldsymbol{\alpha}$ se obtienen del primer eigenvector
+    de $\mathbf{C}$, normalizado.\
+    $$
+    \alpha_q=\vert \mathbf{P}_{q,1}\vert, \quad\sum_{q=1}^Q \alpha_q=1
+    $$
+    \begin{equation}
+      \boldsymbol{\alpha}=\left[`r knitr::combine_words(format(round(alpha,3), scientific = FALSE, nsmall = 3), and = ",", oxford_comma = FALSE)`\right]
+    \end{equation}
+    
+### Matriz compromiso:
+
+Los pesos anteriores nos permiten calcular la matriz compromiso:
+\begin{equation}
+\mathbf{S}_{[+]} = \sum_{q=1}^Q \alpha_q \widetilde{\mathbf{S}}_q.
+\end{equation}
+   
+   Ésta es una combinación ponderada de las imputaciones que maximiza la información compartida por ellas. Esta combinación define el llamado *compromiso*, que puede interpretarse como la estructura factorial más representativa del conjunto de imputaciones.
+
+### Descomposición del compromiso
+
+Se descompone la matriz compromiso en sus valores propios:
+\begin{equation}
+\mathbf{S}_{[+]} = \mathbf{Q}\boldsymbol{\Xi}\mathbf{Q}^\intercal.
+\end{equation}
+
+### Coordenadas finales:
+
+Para hacer interpretable el compromiso, las posiciones de las observaciones en el nuevo espacio se obtienen
+como las primeras $S=5$ columnas de:
+
+\begin{equation}
+\mathbf{T}_c = \mathbf{Q} \boldsymbol{\Xi}^{1/2}.
+\end{equation}\
+
+```{r, eval=T}
+latex_Zcstd <- make_latex_chunks(Zc * sqrt(1/5), chunk_size = 55, digits = 3)
+```
+
+\small
+
+\begin{equation}
+\label{eq:Zstandc}
+  \begin{split}
+    \mathbf{T}^{\intercal}_{c} =&
+    \left[`r latex_Zcstd[[1]]`\right] \\
+  \end{split}
+\end{equation}
+
+\normalsize
+
+Las coordenadas $\mathbf{Z}_c$ representan la posición de los individuos en un espacio que sintetiza la estructura común a todal las imputaciones, mientras que la dispersión de las soluciones individuales alrededor de este compromiso refleja la incertidumbre asociada a los valores faltantes.
+
+Con este procedimiento concluimos el STATIS *per se* y, por extensión, el MIRIMFA. 
+Sin embargo, también es posible calcular una imputación estandarizada compromiso, $\mathbf{X}_{[+]}$, para interpretar y evaluar el desempeño de MIRIMFA. 
+
+# Cálculo de la Imputación Compromiso
+
+El STATIS nos dio un espacio compromiso $\mathbf{T}_c$ que sintetiza la estructura común a las tres imputaciones. Este espacio es útil para la evaluación y visualización, pero no es directamente una base de datos imputable: está en el espacio de los individuos, no en el espacio original de las variables. Para obtener una imputación concreta en el espacio original —que llamaremos $\mathbf{X}_{[+]}$— necesitamos proyectar de vuelta mediante un procedimiento iterativo análogo al de RIMFA, pero usando $\mathbf{T}_c$ como estructura de referencia fija.
+
+### Inicialización:
+
+-   Se rellenan los valores faltantes con ceros para obtener
+    $\mathbf{X}'^{(0)}$.
+
+-   Se normalizan los datos columna a columna utilizando la media
+    $\boldsymbol{\mu}$ y la desviación estándar
+    $\boldsymbol{\sigma}$:
+
+\begin{equation}
+\bar{\mathbf{X}}'^{(0)} = \frac{\mathbf{X}'^{(0)} - \boldsymbol{\mu}}{\boldsymbol{\sigma}},
+\end{equation}
+
+donde la división se hace elemento por elemento.
+
+
+```{r, eval=T}
+X0zeroAll <- cbind.data.frame(
+  data_amputed[, sapply(data_amputed, is.numeric)],
+  CDT[, !(colnames(CDT) %in% colnames(data_amputed))]
+)
+X0zeroAll[is.na(X0zeroAll)] <- 0
+
+X0zeroStd <- scale(X0zeroAll)
+mu    <- attr(X0zeroStd, "scaled:center")
+sigma <- attr(X0zeroStd, "scaled:scale")
+
+Xz_11 <- X0zeroStd[X0zeroAll$Age < 13, 1:Kn[1]]
+Xz_12 <- X0zeroStd[X0zeroAll$Age < 13, (cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xz_13 <- X0zeroStd[X0zeroAll$Age < 13, (cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xz_14 <- X0zeroStd[X0zeroAll$Age < 13, (cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+Xz_21 <- X0zeroStd[X0zeroAll$Age >= 13, 1:Kn[1]]
+Xz_22 <- X0zeroStd[X0zeroAll$Age >= 13, (cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xz_23 <- X0zeroStd[X0zeroAll$Age >= 13, (cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xz_24 <- X0zeroStd[X0zeroAll$Age >= 13, (cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+
+```{r latex_Xz, eval=T}
+Xz_list <- list(
+  stratum1 = list(Xz_11, Xz_12, Xz_13, Xz_14),
+  stratum2 = list(Xz_21, Xz_22, Xz_23, Xz_24)
+)
+latex_Xz <- lapply(Xz_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'bar(0, estandarizada)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xz11}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[1,1]}=&
+      \left[`r latex_Xz[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xz12}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[1,2]}=&
+      \left[`r latex_Xz[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xz13}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[1,3]}=&
+      \left[`r latex_Xz[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xz14}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[1,4]}=&
+      \left[`r latex_Xz[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+\begin{equation}
+  \label{eq:Xz21}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[2,1]}=&
+      \left[`r latex_Xz[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xz22}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[2,2]}=&
+      \left[`r latex_Xz[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xz23}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[2,3]}=&
+      \left[`r latex_Xz[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xz24}
+    \begin{split}
+      \bar{{\mathbf{X}}}'^{(0)\intercal}_{[2,4]}=&
+      \left[`r latex_Xz[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+### Cálculo de las variables latentes:
+
+Usando $\mathbf{T}_c$, se calculan las variables latentes $\mathbf{V}$
+en cada iteración $l$:
+
+\begin{equation}
+\mathbf{V}^{(l)} = \left(\mathbf{T}_c^\intercal \mathbf{T}_c\right)^{-1} \mathbf{T}_c^\intercal \bar{\mathbf{X}}'^{(l)}.
+\end{equation}
+
+Por ejemplo, para $l=1$:
+
+```{r, eval=T}
+V1 <- solve(t(Zc) %*% Zc) %*% t(Zc) %*% X0zeroStd
+```
+
+```{r, eval=T}
+latex_V1 <- make_latex_chunks(t(V1), chunk_size = 47, digits = 3)
+```
+
+\small
+
+\begin{equation}
+  \label{eq:V1}
+    \begin{split}
+      \mathbf{V}^{(1)}=&
+      \left[`r latex_V1[[1]]`\right]
+    \end{split}
+\end{equation}
+
+\normalsize
+
+### Reconstrucción del conjunto de datos:
+
+-   Se reconstruye $\widehat{\mathbf{X}}'$ en el espacio normalizado:
+
+  \begin{equation}
+  \bar{\widehat{\mathbf{X}}}'^{(l)} = \mathbf{T}_c \mathbf{V}^{(l)}.
+  \end{equation}
+
+-   Se deshace la normalización para regresar a la escala original:
+
+  \begin{equation}
+  \widehat{\mathbf{X}}'^{(l)} = \boldsymbol{\sigma} \circ \bar{\widehat{\mathbf{X}}}'^{(l)} + \boldsymbol{\mu},
+  \end{equation}
+  
+donde $\circ$ es la multiplicación elemento por elemento.
+
+Por lo tanto, las MDC reconstruidas para la primera iteración son:
+
+```{r, eval=T}
+Xbarhat1 <- Zc %*% V1
+
+
+Xhat1 <- sweep(Xbarhat1, 2, sigma, "*")
+Xhat1 <- sweep(Xhat1, 2, mu, "+")
+
+Xh1_11 <- Xhat1[X0zeroAll$Age < 13, 1:Kn[1]]
+Xh1_12 <- Xhat1[X0zeroAll$Age < 13, (cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xh1_13 <- Xhat1[X0zeroAll$Age < 13, (cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xh1_14 <- Xhat1[X0zeroAll$Age < 13, (cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+Xh1_21 <- Xhat1[X0zeroAll$Age >= 13, 1:Kn[1]]
+Xh1_22 <- Xhat1[X0zeroAll$Age >= 13, (cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xh1_23 <- Xhat1[X0zeroAll$Age >= 13, (cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xh1_24 <- Xhat1[X0zeroAll$Age >= 13, (cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+
+```{r latex_Xh1, eval=T}
+Xh1_list <- list(
+  stratum1 = list(Xh1_11, Xh1_12, Xh1_13, Xh1_14),
+  stratum2 = list(Xh1_21, Xh1_22, Xh1_23, Xh1_24)
+)
+latex_Xh1 <- lapply(Xh1_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X'hat(1, compromiso)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xhat1_11}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,1]}=&
+      \left[`r latex_Xh1[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_12}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,2]}=&
+      \left[`r latex_Xh1[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_13}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,3]}=&
+      \left[`r latex_Xh1[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_14}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[1,4]}=&
+      \left[`r latex_Xh1[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_21}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,1]}=&
+      \left[`r latex_Xh1[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_22}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,2]}=&
+      \left[`r latex_Xh1[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_23}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,3]}=&
+      \left[`r latex_Xh1[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xhat1_24}
+    \begin{split}
+      \widehat{\mathbf{X}}'^{(1)\intercal}_{[2,4]}=&
+      \left[`r latex_Xh1[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+Al igual que con la imputación original, se sustituyen los valores imputados en la matriz de datos observados original para evitar variación en éstos. Luego de varias iteraciones, se calcula el cambio en las variables latentes entre iteraciones
+consecutivas y se detiene el proceso cuando se excede el número predeterminado de imputaciones o:\
+\begin{equation}
+\Delta \mathbf{V} = \sqrt{\sum_{k=1}^K \sum_{s=1}^S \left(\mathbf{V}_{ks}^{(l)} - \mathbf{V}_{ks}^{(l-1)}\right)^2}<\epsilon,
+\end{equation} donde $\epsilon$ es un valor arbitrario.
+
+Al hacer este proceso con $\epsilon=1\times 10^{-6}$, se obtuvo:
+
+```{r, eval=TRUE}
+# Missingness mask for the compromise (same positions as original amputation)
+Rprime_c <- is.na(as.matrix(X0zeroAll))
+
+# Initialize
+Xc_imp <- X0zeroStd
+Xc_imp[is.na(Xc_imp)] <- 0
+
+convergence_threshold <- 1e-6
+max_iterations <- 100
+converged_c <- FALSE
+iteration_c <- 1
+
+while (!converged_c && iteration_c <= max_iterations) {
+
+  Vc <- solve(t(Zc) %*% Zc) %*% t(Zc) %*% Xc_imp
+
+  Xbarhat_c <- Zc %*% Vc
+
+  Xhat_c <- sweep(Xbarhat_c, 2, sigma, "*")
+  Xhat_c <- sweep(Xhat_c, 2, mu, "+")
+
+  Xhat_c_std <- scale(Xhat_c, center = mu, scale = sigma)
+
+  Xc_imp_new <- Xc_imp
+  Xc_imp_new[Rprime_c] <- Xhat_c_std[Rprime_c]
+
+  diff_c <- sum((Xc_imp_new - Xc_imp)^2) / sum(Xc_imp^2)
+  converged_c <- diff_c < convergence_threshold
+
+  Xc_imp <- Xc_imp_new
+  iteration_c <- iteration_c + 1
+}
+
+# Back to original scale
+Xplus <- sweep(Xc_imp, 2, sigma, "*")
+Xplus <- sweep(Xplus, 2, mu, "+")
+
+
+```
+
+
+```{r, eval=TRUE}
+# Enforce mirror constraint on Xplus before splitting
+col_names_plus <- colnames(Xplus)
+base_names_plus <- unique(sub("_[01]$", "", grep("_[01]$", col_names_plus, value = TRUE)))
+
+for (base in base_names_plus) {
+  col1 <- paste0(base, "_1")
+  col0 <- paste0(base, "_0")
+  if (col1 %in% col_names_plus && col0 %in% col_names_plus) {
+    Xplus[, col0] <- 1 - Xplus[, col1]
+  }
+}
+```
+
+
+```{r, eval=TRUE}
+Xplus_11 <- Xplus[X0zeroAll$Age < 13, 1:Kn[1]]
+Xplus_12 <- Xplus[X0zeroAll$Age < 13, (cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xplus_13 <- Xplus[X0zeroAll$Age < 13, (cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xplus_14 <- Xplus[X0zeroAll$Age < 13, (cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+Xplus_21 <- Xplus[X0zeroAll$Age >= 13, 1:Kn[1]]
+Xplus_22 <- Xplus[X0zeroAll$Age >= 13, (cumsum(Kn)[1]+1):cumsum(Kn)[2]]
+Xplus_23 <- Xplus[X0zeroAll$Age >= 13, (cumsum(Kn)[2]+1):cumsum(Kn)[3]]
+Xplus_24 <- Xplus[X0zeroAll$Age >= 13, (cumsum(Kn)[3]+1):cumsum(Kn)[4]]
+```
+
+
+
+
+```{r latex_Xplus, eval=T}
+Xplus_list <- list(
+  stratum1 = list(Xplus_11, Xplus_12, Xplus_13, Xplus_14),
+  stratum2 = list(Xplus_21, Xplus_22, Xplus_23, Xplus_24)
+)
+latex_Xplus <- lapply(Xplus_list, function(stratum) lapply(stratum, make_latex_chunks, digits = 3))
+```
+
+\small
+
+```{=html}
+<details>
+<summary>Mostrar submatrices: X[+](imputación compromiso)</summary>
+<p>
+```
+
+\begin{equation}
+  \label{eq:Xplus_11}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][1,1]}=&
+      \left[`r latex_Xplus[[1]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xplus_12}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][1,2]}=&
+      \left[`r latex_Xplus[[1]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xplus_13}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][1,3]}=&
+      \left[`r latex_Xplus[[1]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xplus_14}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][1,4]}=&
+      \left[`r latex_Xplus[[1]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+
+\begin{equation}
+  \label{eq:Xplus_21}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][2,1]}=&
+      \left[`r latex_Xplus[[2]][[1]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xplus_22}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][2,2]}=&
+      \left[`r latex_Xplus[[2]][[2]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xplus_23}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][2,3]}=&
+      \left[`r latex_Xplus[[2]][[3]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+\begin{equation}
+  \label{eq:Xplus_24}
+    \begin{split}
+      \widehat{\mathbf{X}}^{\intercal}_{[+][2,4]}=&
+      \left[`r latex_Xplus[[2]][[4]][[1]]`\right]
+    \end{split}
+\end{equation}
+
+```{=html}
+<script>
+document.currentScript.closest('details').addEventListener('toggle', function() {
+  if (this.open) MathJax.typesetPromise([this]);
+});
+</script>
+</p>
+</details>
+```
+
+
+### Evaluación de MIRIMFA
+
+Recordemos que esta imputación fue una simulación a partir de una amputación de una base de datos completa. Por lo tanto, con la matriz compromiso agregada por categoría, $\mathbf{X}_{[+]}$, se
+pueden analizar los resultados de MIRIMFA mediante correlaciones entre la matriz compromiso agregada y los datos reales. Por ejemplo:
+
+-   El coeficiente de correlación ajustado $R_V$, obtenido en este caso como
+    $\bar{R}_V = `r format(RVplus, scientific = FALSE, nsmall = 2 )`$, muestra un excelente ajuste entre los datos originales y los imputados.
+-   El análisis conjunto mediante MFA revela patrones similares, como se
+    observa en las figuras siguientes:
+
+```{r comparVarMIRIMFApoison, eval=TRUE, fig.cap='Comparación de la distribución de los variables en el espacio de las dos primeras dimensiones del MFA aplicado a la base de datos original Poison y a la amputada al 10\\% e imputada mediante MIRIMFA.' }
+
+var_plot1 <- fviz_pca_var(MFA_poison[["global.pca"]],
+                          repel = TRUE)
+var_plot2 <- fviz_pca_var(MFA_MIRIMFA[["global.pca"]],
+                          repel = TRUE)
+var_comparison <- grid.arrange(var_plot1, var_plot2, ncol = 2)
+```
+
+
+```{r comparIndMIRIMFApoison, eval=TRUE, fig.cap='Comparación de la distribución de los individuos en el espacio de las dos primeras dimensiones del MFA aplicado a la base de datos original Poison y a la amputada al 10\\% e imputada mediante MIRIMFA.' }
+
+Ind_plot1 <- fviz_mfa_ind(MFA_poison,repel = T)
+Ind_plot2 <- fviz_mfa_ind(MFA_MIRIMFA,repel = T)
+Ind_comparison <- grid.arrange(Ind_plot1, Ind_plot2, ncol = 2)
+```
+Finalmente, MIRIMFA permite observar la incertidumbre. Podemos comparar las proyecciones de las imputaciones sobre el espacio compromiso.
+
+En la figura siguiente, vemos los dos primero ejes principales de cada una de las imputaciones, donde el eje vertical y horizontal son los primeros ejes principales del espacio compromiso. Como vemos, están alineados de forma casi perfecta, aunque el segundo eje aparece rotado para algunas de las imputaciones. Esto es natural y esperable y una de las razones por la que usamos el procedimiento ACT-STATIS: porque es robusto a las rotaciones. Los resultados de esta gráfica nos dicen que la dispersión es poca y la imputación es buena.
+
+```{r plotMIRIMFA, eval=TRUE, fig.cap='Proyección de los factores del MFA aplicado a las imputaciones sobre los dos primeros ejes del espacio compromiso de la base de datos Poison al 10\\% de amputación', out.width = '70%'}
+plotFactorsMIRIMFA(toyMIRIMFA)
+```
+
+Por otra parte, en la gráfica siguiente vemos las variables proyectadas sobre las primeras dimensiones del espacio compromiso. Con una cruz vemos todas las imputaciones individuales y con un círculo vemos marcada la variable del espacio compromiso. Si todas coinciden, el mapeo es perfecto. Mientras más dispersas estén las variables individuales con respecto al compromiso, más se tiene que desconfiar de la imputación múltiple.
+
+Como se puede ver, la mayoría de las variables individuales coinciden con el compromiso, aunque algunas se desvían, pero en general coinciden tan bien que se enciman pareciendo una sola cruz rodeada por el círculo.
+
+```{r plotMIRIMFAvars, eval=TRUE, fig.cap='Proyección de las variables de los MFAs aplicados tanto a las imputaciones como a su compromiso sobre los dos primeros ejes del espacio compromiso de la base de datos Poison al 10\\% de amputación', out.width = '70%'}
+res <- plotVarMIRIMFA(toyMIRIMFA, graph = F)
+res$ggp + theme(
+  legend.text = element_text(size = 8),
+  legend.title = element_text(size = 8),
+  legend.key.size = unit(0.4, "cm")
+)
+
+```
+
+Con estos resultados, concluimos la ejemplificación de MIRIMFA en un
+caso con 10% de datos faltantes. En la siguiente sección, exploraremos
+su desempeño con mayores porcentajes de datos perdidos.
+
+\newpage
+
+# Implementación del método MIRIMFA
+
+Con los elementos introducidos en las secciones anteriores, es posible delimitar **MIRIMFA (Imputación Múltiple mediante Análisis Factorial Múltiple Regularizado Iterativo)**. Este método combina:
+
+- imputación iterativa basada en MFA (RIMFA),
+- imputación múltiple para capturar incertidumbre,
+- y agregado de resultados mediante ACT-STATIS.
+
+El objetivo de MIRIMFA es permitir un análisis factorial múltiple estable y reproducible en presencia de datos faltantes estructurados, visualizando al mismo tiempo la incertidumbre inducida por la imputación.
+
+### Supuestos y alcance
+
+MIRIMFA se apoya en los siguientes supuestos operativos:
+
+- Los datos corresponden a $I$ individuos descritos por variables mixtas (cuantitativas y cualitativas) organizadas en $N$ grupos.
+- El objetivo principal del análisis es un MFA de dimensión reducida.
+- El mecanismo de pérdida pertenece a las clases MCAR-WS, MCAR-SS o MNAR-WS con sesgo de desplazamiento.
+- La estructura factorial inducida por el MFA es informativa para la reconstrucción de los valores faltantes.
+
+### Parámetros definidos *a priori*
+
+Antes de ejecutar MIRIMFA, deben fijarse los siguientes parámetros:
+
+- **Número de imputaciones** $Q$:  
+
+Controla la precisión con la que se evalúa la incertidumbre asociada a la imputación.
+Este valor depende del porcentaje de datos faltantes y del nivel de error aceptable en las varianzas [@rubin_multiple_2004; @van_buuren_flexible_2018] 
+Para fines ilustrativos, se usaron 3 imputaciones, pero se recomienda consultar el trabajo de von Hippel [-@vonhippel2018imputationsneedtwostagecalculation] para determinarla con precisión.
+
+- **Dimensión del espacio factorial** $S$:  
+  Número de dimensiones retenidas en cada MFA. Este parámetro define el rango de la reconstrucción y debe elegirse con base en criterios clásicos (inercia explicada, codo, interpretabilidad).
+
+- **Pesos de filas** $\mathbf{w}$:  
+  - Para mecanismos MCAR y MAR: $r_i = \frac{1}{I}$.
+  - Para MNAR con sesgo de desplazamiento: $\mathbf{r}$ puede ajustarse utilizando conocimiento de área.
+
+- **Parámetro de desplazamiento** $\delta$ (opcional):  
+  Utilizado únicamente en contextos MNAR con sesgo de desplazamiento, y seleccionado mediante análisis de sensibilidad.
+
+### Algoritmo MIRIMFA
+
+Sea $\mathbf{X}$ la matriz de datos observados y $\mathbf{R}$ su matriz indicadora. El algoritmo MIRIMFA procede como sigue:
+
+#### Paso 0: Preparación de los datos
+- Construir la tabla disyuntiva completa observada $\mathbf{X}'$.
+- Identificar los grupos de variables y su tipo (cuantitativo o cualitativo).
+
+#### Paso 1: Generación de imputaciones múltiples
+
+Para cada imputación $q = 1,\dots,Q$:
+
+1. Inicializar los valores faltantes en $\mathbf{X}'$ con valores aleatorios distintos entre imputaciones, respetando la restricción de que estén en $(0,1)$ y para cada individuo y variable, la suma de las categorías correspondientes sea igual a uno.
+2. Aplicar el algoritmo **RIMFA** hasta convergencia, utilizando:
+   - dimensión $S$,
+   - pesos $\mathbf{w}$,
+   - regularización de eigenvalores.
+3. Obtener una base completa imputada $\mathbf{X}_q$.
+4. Aplicar un MFA de dimensión $S$ a $\mathbf{X}_q$ y extraer la matriz de coordenadas de los individuos $\mathbf{T}_q$.
+
+Las bases imputadas $\mathbf{X}_1,\dots,\mathbf{X}_Q$ coinciden en los valores observados y difieren únicamente en los valores imputados.
+
+#### Paso 2: Agregado mediante ACT-STATIS
+
+- Aplicar ACT-STATIS al conjunto de matrices $\{\mathbf{T}_1,\dots,\mathbf{T}_Q\}$.
+- Obtener:
+  - los pesos $\alpha_q$ asociados a cada imputación,
+  - la matriz compromiso $\mathbf{S}_{[+]}$,
+  - y las coordenadas finales $\mathbf{T}_c$ de los individuos en el espacio compromiso.
+
+Estas coordenadas constituyen el resultado principal del análisis MIRIMFA.
+
+### Interpretación de los resultados
+
+El método MIRIMFA produce:
+
+- una representación factorial común ($\mathbf{T}_c$),
+- una representación explícita de la variabilidad entre imputaciones,
+- y diagnósticos de estabilidad del análisis frente a los datos faltantes.
+
+Una dispersión pequeña entre las soluciones individuales indica que la estructura factorial es robusta a la imputación, mientras que una dispersión grande sugiere que la incertidumbre inducida por los valores faltantes limita la interpretabilidad del análisis.
+
+# Evaluación de MIRIMFA con Mayores Porcentajes de Datos Perdidos
+
+En esta sección, evaluaremos el desempeño de MIRIMFA en escenarios con porcentajes más altos de datos faltantes. 
+Este análisis es esencial para determinar la robustez del método frente a condiciones de información más limitadas. 
+Consideraremos los siguientes aspectos clave:
+
+# Configuración del Experimento
+
+-   **Generación de Datos Faltantes:**\
+    Se aplicará un mecanismo de datos faltantes MNAR-WS para introducir porcentajes de datos perdidos del 20%, 25%, 30%, 35%, 40%, 45% y 50% en el conjunto de datos.
+
+-   **Conjuntos de Datos Simulados:**\
+    Utilizaremos conjuntos de datos simulados, similares al caso
+    *Poison* empleado anteriormente, para garantizar la replicabilidad de los experimentos.
+
+-   **Parámetros del Modelo:**
+
+    -   Número de imputaciones múltiples iniciales: $Q = 5$.
+    -   Dimensiones retenidas en el MFA: $S = 2$.
+
+# Métricas de Evaluación
+
+Para medir el desempeño de MIRIMFA, utilizaremos las siguientes
+métricas:
+
+1.  **Coeficiente** $R_V$ Ajustado:\
+    Evaluaremos la similitud entre las matrices de datos imputados y la matriz original. 
+    Un mayor valor de $R_V$ ajustado indica una mejor recuperación de la estructura del conjunto de datos.
+
+2.  **Distribución Conjunta Mediante MFA:** Compararemos las proyecciones en el espacio propio para evaluar la coherencia de las imputaciones.
+
+3.  **Análisis de la Variabilidad de las Imputaciones:**
+
+    -   Proyección de las variables de las imputaciones individuales
+        sobre el espacio compromiso.\
+    -   Proyección de los factores de las imputaciones individuales
+        sobre el espacio compromiso.
+
+# Resultados
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, error=FALSE}
+MIRIMFAs <- 
+  MFA_MIRIMFAs <- 
+  Maye <- 
+  realMiss <- 
+  RVsing1 <-
+  RVsing2 <-
+  RVsing3 <-
+  RVsing4 <-
+  RVsing5 <-
+  singleRIMFA <- list()
+goals <- c(0.2, 0.25, 0.3, 0.35, 0.4, 0.45)
+
+
+for (i in 1:length(goals)) {
+  goal <- goals[i]
+  max_retries <- 10  # Set a limit to retries
+  retries <- 0
+  
+  repeat {
+    retries <- retries + 1
+    
+    # Ampute the data
+    data_amputedMFA <- combine_amputation_split(
+      data = poison,
+      central_tendencies = c_adults,
+      target_missingness = goal,
+      groups = groups,
+      split_ratio = 0.5
+    )
+    
+    # Restore the first two columns (if needed)
+    data_amputedMFA[, 1:2] <- poison[, 1:2]
+    
+    # Check for columns with no variability
+    no_variability_cols <- sapply(data_amputedMFA, function(col) {
+      unique_vals <- unique(na.omit(col)) # Exclude NAs
+      length(unique_vals) <= 1           # True if only 0 or 1 unique value
+    })
+    
+    if (any(no_variability_cols)) {
+      message(paste("No variability detected for goal", goal, "- Retrying amputation... (Attempt:", retries, ")"))
+      
+      # Break if max retries are reached
+      if (retries >= max_retries) {
+        message(paste("Max retries reached for goal", goal, "- Skipping this goal."))
+        break
+      }
+      
+      next  # Retry with a new amputation
+    }
+    
+    realMiss[[i]] <- sum(is.na(data_amputedMFA))/(I*J)
+    # If all columns have variability, proceed
+    tryCatch({
+      MIRIMFAs[[i]] <- MIRIMFA(
+        data_amputedMFA,
+        group = Jn,
+        type = c("s", "n", "n", "n"),
+        M = 5,
+        row.w = w,
+        ncp = 2
+      )
+      
+      # Perform MFA on the imputed data
+      MFA_MIRIMFAs[[i]] <- MFA(
+        MIRIMFAs[[i]]$res.imputeMFA,
+        group = c(2, 2, 5, 6), # Same group structure as poison
+        type = c("s", "n", "n", "n"),
+        name.group = c("Group1", "Group2", "Group3", "Group4"),
+        graph = FALSE
+      )
+      
+      # Prepare data for RV calculation
+      singleRIMFA1 <- as.data.frame(dummy_cols(MIRIMFAs[[i]][["res.MI"]][[1]],
+                                              remove_selected_columns = TRUE))
+      singleRIMFA2 <- as.data.frame(dummy_cols(MIRIMFAs[[i]][["res.MI"]][[2]],
+                                              remove_selected_columns = TRUE))
+      singleRIMFA3 <- as.data.frame(dummy_cols(MIRIMFAs[[i]][["res.MI"]][[3]],
+                                              remove_selected_columns = TRUE))
+      singleRIMFA4 <- as.data.frame(dummy_cols(MIRIMFAs[[i]][["res.MI"]][[4]],
+                                              remove_selected_columns = TRUE))
+      singleRIMFA5 <- as.data.frame(dummy_cols(MIRIMFAs[[i]][["res.MI"]][[5]],
+                                              remove_selected_columns = TRUE))
+      MIRIMFA_MDC <- as.data.frame(dummy_cols(MIRIMFAs[[i]]$res.imputeMFA, 
+                                              remove_selected_columns = TRUE))
+      Maye[[i]] <- RVadjMaye(as.matrix(MIRIMFA_MDC), as.matrix(MDC), center = TRUE)
+      RVsing1[[i]] <- RVadjMaye(as.matrix(singleRIMFA1), as.matrix(MDC), center = TRUE)
+      RVsing2[[i]] <- RVadjMaye(as.matrix(singleRIMFA2), as.matrix(MDC), center = TRUE)
+      RVsing3[[i]] <- RVadjMaye(as.matrix(singleRIMFA3), as.matrix(MDC), center = TRUE)
+      RVsing4[[i]] <- RVadjMaye(as.matrix(singleRIMFA4), as.matrix(MDC), center = TRUE)
+      RVsing5[[i]] <- RVadjMaye(as.matrix(singleRIMFA5), as.matrix(MDC), center = TRUE)
+    }, error = function(e) {
+      # Handle errors gracefully (e.g., log them)
+      message(paste("Error in MIRIMFA for goal", goal, ":", e$message))
+    })
+    
+    break  # Exit the repeat loop once processing is successful
+  }
+}
+realMiss <- unlist(realMiss)*100
+Maye <- unlist(Maye)
+RVsing1 <- unlist(RVsing1)
+RVsing2 <- unlist(RVsing2)
+RVsing3 <- unlist(RVsing3)
+RVsing4 <- unlist(RVsing4)
+RVsing5 <- unlist(RVsing5)
+RVvsMiss <- data.frame(Missing = realMiss, 
+                       MIRIMFA = Maye, 
+                       `1er RIMFA` = RVsing1, 
+                       `2o RIMFA` = RVsing2,
+                       `3er RIMFA` = RVsing3,
+                       `4o RIMFA` = RVsing4,
+                       `5o RIMFA` = RVsing5)
+```
+
+Los valores del coeficiente $R_V$ ajustado para cada porcentaje de datos faltantes se representan en la figura siguiente, comparados
+con los RIMFAs que los componen.
+
+```{r RVspercent, eval=TRUE, fig.cap='Coeficiente RV contra porcentaje de datos faltantes comparando resultados de MIRIMFA y las imputaciones individuales que lo conforman.'}
+RVvsMiss_long <- RVvsMiss %>%
+  pivot_longer(cols = -1, 
+               names_to = "Variables", 
+               values_to = "Values")
+
+ggplot(RVvsMiss_long, aes(x = Missing, y = Values, color=Variables)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Coeficiente RV contra porcentaje de datos faltantes",
+       x = "Porcentaje de datos faltantes",
+       y = "RV ajustado")
+```
+
+Como se puede ver, todas las imputaciones tienen un $R_V$ ajustado bastante cercano a 1, con el porcentaje de datos faltantes reduciendo su valor gradualmente, pero negligiblemente. También se puede ver que MIRIMFA tiene un desempeño menor que cualquier imputación sólo con RIMFA, pero la diferencia es tan pequeña que es atribuible al ruido estadístico. Por lo tanto, podemos concluir que MIRIMFA es al menos tan bueno como RIMFA.
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, error=FALSE}
+decathlon2.active <- decathlon2[1:23, 1:10]
+MIPCAs <- 
+  PCA_MIPCAs <- 
+  MayePCA <- 
+  realMissPCA <- 
+  RVsingPCA1 <-
+  RVsingPCA2 <-
+  RVsingPCA3 <-
+  RVsingPCA4 <-
+  RVsingPCA5 <-
+  singleRIPCA <- list()
+goals <- c(0.2, 0.25, 0.3, 0.35, 0.4, 0.45)
+
+
+for (i in 1:length(goals)) {
+  goal <- goals[i]
+  max_retries <- 10  # Set a limit to retries
+  retries <- 0
+  
+  repeat {
+    retries <- retries + 1
+    
+    # Ampute the data
+    # Apply MCAR mechanism using the ampute function from missMethods
+    data_amputedPCA <- ampute(data = decathlon2.active, 
+                                 prop = goal)$amp
+
+    realMissPCA[[i]] <- sum(is.na(data_amputedPCA))/(nrow(data_amputedPCA)*ncol(data_amputedPCA))
+    # If all columns have variability, proceed
+    tryCatch({
+      MIPCAs[[i]] <- MIPCA(
+        data_amputedPCA,
+        nboot = 5,
+        ncp = 2
+      )
+      
+      # Perform PCA on the imputed data
+      PCA_MIPCAs[[i]] <- PCA(
+        MIPCAs[[i]]$res.imputePCA,
+        ncp=2,
+        graph = FALSE
+      )
+      
+      # Prepare data for RV calculation
+      singleRIPCA1 <- as.data.frame(MIPCAs[[i]][["res.MI"]][[1]])
+      singleRIPCA2 <- as.data.frame(MIPCAs[[i]][["res.MI"]][[2]])
+      singleRIPCA3 <- as.data.frame(MIPCAs[[i]][["res.MI"]][[3]])
+      singleRIPCA4 <- as.data.frame(MIPCAs[[i]][["res.MI"]][[4]])
+      singleRIPCA5 <- as.data.frame(MIPCAs[[i]][["res.MI"]][[5]])
+      MayePCA[[i]] <- RVadjMaye(as.matrix(MIPCAs[[i]]$res.imputePCA), as.matrix(decathlon2.active), center = TRUE)
+      RVsingPCA1[[i]] <- RVadjMaye(as.matrix(singleRIPCA1), as.matrix(decathlon2.active), center = TRUE)
+      RVsingPCA2[[i]] <- RVadjMaye(as.matrix(singleRIPCA2), as.matrix(decathlon2.active), center = TRUE)
+      RVsingPCA3[[i]] <- RVadjMaye(as.matrix(singleRIPCA3), as.matrix(decathlon2.active), center = TRUE)
+      RVsingPCA4[[i]] <- RVadjMaye(as.matrix(singleRIPCA4), as.matrix(decathlon2.active), center = TRUE)
+      RVsingPCA5[[i]] <- RVadjMaye(as.matrix(singleRIPCA5), as.matrix(decathlon2.active), center = TRUE)
+    }, error = function(e) {
+      # Handle errors gracefully (e.g., log them)
+      message(paste("Error in MIPCA for goal", goal, ":", e$message))
+    })
+    
+    break  # Exit the repeat loop once processing is successful
+  }
+}
+realMissPCA <- unlist(realMissPCA)*100
+MayePCA <- unlist(MayePCA)
+RVsingPCA1 <- unlist(RVsingPCA1)
+RVsingPCA2 <- unlist(RVsingPCA2)
+RVsingPCA3 <- unlist(RVsingPCA3)
+RVsingPCA4 <- unlist(RVsingPCA4)
+RVsingPCA5 <- unlist(RVsingPCA5)
+RVvsMissPCA <- data.frame(Missing = realMissPCA, 
+                       MIPCA = MayePCA, 
+                       `1er RIPCA` = RVsingPCA1, 
+                       `2o RIPCA` = RVsingPCA2,
+                       `3er RIPCA` = RVsingPCA3,
+                       `4o RIPCA` = RVsingPCA4,
+                       `5o RIPCA` = RVsingPCA5)
+```
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, error=FALSE}
+with_seed(123, {
+MIMCAs <- 
+  MCA_MIMCAs <- 
+  MayeMCA <- 
+  realMissMCA <- 
+  RVsingMCA1 <-
+  RVsingMCA2 <-
+  RVsingMCA3 <-
+  RVsingMCA4 <-
+  RVsingMCA5 <-
+  singleRIMCA <- list()
+goals <- c(0.2, 0.25, 0.3, 0.35, 0.4, 0.45)
+
+
+for (i in 1:length(goals)) {
+  goal <- goals[i]
+  max_retries <- 10  # Set a limit to retries
+  retries <- 0
+  
+  repeat {
+    retries <- retries + 1
+    
+    # Ampute the data
+    data_amputedMCA <- combine_amputation_split(
+      data = poison,
+      central_tendencies = c_adults,
+      target_missingness = goal,
+      groups = groups,
+      split_ratio = 0.5
+    )
+    
+    # Restore the first two columns (if needed)
+    data_amputedMCA <- data_amputedMCA %>% select(-c(1,2))
+
+    realMissMCA[[i]] <- sum(is.na(data_amputedMCA))/(nrow(data_amputedMCA)*ncol(data_amputedMCA))
+    # If all columns have variability, proceed
+    tryCatch({
+      MIMCAs[[i]] <- MIMCA(
+        data_amputedMCA,
+        nboot = 5,
+        ncp = 2
+      )
+      
+      final_resultMCA <- find_category(data_amputedMCA, MIMCAs[[i]]$res.imputeMCA)
+      
+      # Perform MCA on the imputed data
+      MCA_MIMCAs[[i]] <- MCA(
+        final_resultMCA,
+        ncp=2,
+        graph = FALSE
+      )
+      
+      # Prepare data for RV calculation
+      singleRIMCA1 <- as.data.frame(dummy_cols(MIMCAs[[i]][["res.MI"]][[1]],
+                                              remove_selected_columns = TRUE))
+      singleRIMCA2 <- as.data.frame(dummy_cols(MIMCAs[[i]][["res.MI"]][[2]],
+                                              remove_selected_columns = TRUE))
+      singleRIMCA3 <- as.data.frame(dummy_cols(MIMCAs[[i]][["res.MI"]][[3]],
+                                              remove_selected_columns = TRUE))
+      singleRIMCA4 <- as.data.frame(dummy_cols(MIMCAs[[i]][["res.MI"]][[4]],
+                                              remove_selected_columns = TRUE))
+      singleRIMCA5 <- as.data.frame(dummy_cols(MIMCAs[[i]][["res.MI"]][[5]],
+                                              remove_selected_columns = TRUE))
+      MIMCA_MDC <- as.data.frame(dummy_cols(final_resultMCA, 
+                                              remove_selected_columns = TRUE))
+      MayeMCA[[i]] <- RVadjMaye(as.matrix(MIMCA_MDC), as.matrix(MDC), center = TRUE)
+      RVsingMCA1[[i]] <- RVadjMaye(as.matrix(singleRIMCA1), as.matrix(MDC), center = TRUE)
+      RVsingMCA2[[i]] <- RVadjMaye(as.matrix(singleRIMCA2), as.matrix(MDC), center = TRUE)
+      RVsingMCA3[[i]] <- RVadjMaye(as.matrix(singleRIMCA3), as.matrix(MDC), center = TRUE)
+      RVsingMCA4[[i]] <- RVadjMaye(as.matrix(singleRIMCA4), as.matrix(MDC), center = TRUE)
+      RVsingMCA5[[i]] <- RVadjMaye(as.matrix(singleRIMCA5), as.matrix(MDC), center = TRUE)
+    }, error = function(e) {
+      # Handle errors gracefully (e.g., log them)
+      message(paste("Error in MIMCA for goal", goal, ":", e$message))
+    })
+    
+    break  # Exit the repeat loop once processing is successful
+  }
+}
+realMissMCA <- unlist(realMissMCA)*100
+MayeMCA <- unlist(MayeMCA)
+RVsingMCA1 <- unlist(RVsingMCA1)
+RVsingMCA2 <- unlist(RVsingMCA2)
+RVsingMCA3 <- unlist(RVsingMCA3)
+RVsingMCA4 <- unlist(RVsingMCA4)
+RVsingMCA5 <- unlist(RVsingMCA5)
+RVvsMissMCA <- data.frame(Missing = realMissMCA, 
+                       MIMCA = MayeMCA, 
+                       `1er RIMCA` = RVsingMCA1, 
+                       `2o RIMCA` = RVsingMCA2,
+                       `3er RIMCA` = RVsingMCA3,
+                       `4o RIMCA` = RVsingMCA4,
+                       `5o RIMCA` = RVsingMCA5)
+})
+```
+
+
+El análisis de los compromisos revela una alta similitud entre las configuraciones factoriales obtenidas a partir de las imputaciones individuales, lo cual se refleja en valores elevados del coeficiente RV ajustado. Esta concordancia sugiere que el procedimiento de imputación no introduce distorsiones significativas en la estructura multivariada de los datos.
+
+Es posible que la pequeña reducción de ajuste de MIRIMFA con respecto a RIMFA se deba a la poca cantidad de imputaciones y a la elección arbitraria de $\mathbf{r}$, que debería de ser evaluada más conciensudamente. Sin embargo, el hecho de que estos dos efectos sean arbitrarios y no tengan impacto significativo en el ajuste sugiere que MIRIMFA es un método robusto.
+
+
+# Discusión
+
+Los resultados obtenidos ponen de manifiesto la robustez del Análisis Factorial Múltiple cuando se combina con estrategias de imputación para el tratamiento de datos faltantes. La elevada concordancia entre las configuraciones factoriales sugiere que la información esencial del sistema multivariado se conserva, incluso en presencia de incertidumbre asociada a la imputación.
+
+El uso del compromiso permite sintetizar de manera eficiente la variabilidad entre imputaciones, proporcionando una representación estable y fácilmente interpretable de los datos. Esta propiedad resulta especialmente valiosa en contextos aplicados, donde la reproducibilidad y la estabilidad de los resultados son aspectos clave.
+
+En comparación con enfoques que analizan cada imputación de forma aislada, la estrategia adoptada en este trabajo ofrece una visión integrada que facilita la interpretación global sin sacrificar rigor estadístico.
+
+# Conclusión.
+
+Los resultados muestran que esta aproximación permite obtener representaciones estables y coherentes, preservando la estructura subyacente de los datos.
+
+La metodología propuesta constituye una herramienta flexible para el análisis multivariado en presencia de datos incompletos, y puede extenderse a contextos donde coexistan variables de distinta naturaleza. Como líneas futuras de investigación, se podría explorar la aplicación del enfoque a conjuntos de datos de mayor complejidad.
+
+Queda pendiente investigar métodos adecuados de asignación de los pesos $\mathbf{r}$ para pérdidas MNAR-SS con desplazamiento, así como buscar métodos computacionales eficientes para aplicar MIRIMFA, ya que, tal como fue implementado en este trabajo, es un método muy demandante en poder de cómputo.
+
+# Referencias {.unnumbered}
+
+::: {#refs}
+:::
+
+\newpage
+
+\newgeometry{margin=1in}
+\appendix
+\restoregeometry
