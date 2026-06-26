@@ -136,7 +136,7 @@ Es necesario precisar que los componentes descritos corresponden a desarrollos e
 No obstante, la revisión formal aquí presentada resulta fundamental, ya que provee una notación unificada que facilita la comprensión del proceso conjunto.
 
 Asimismo, es importante advertir que, aunque la base de datos del capítulo "Ejemplo" representa el caso de escala mínima para la viabilidad del método, el volumen de los datos y las dimensiones de las matrices resultantes siguen siendo considerables. 
-Por ello, se sugiere optar por la versión HTML de este documento (disponible en: [POR DEFINIR]) para una visualización más cómoda de las estructuras matriciales.
+Por ello, se sugiere optar por la versión HTML de este documento (disponible en: https://rmmartinez93.github.io/MIRIMFA-thesis/ para una visualización más cómoda de las estructuras matriciales.
 
 # Base de datos *Poison* y su preparación
 
